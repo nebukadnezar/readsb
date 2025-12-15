@@ -93,16 +93,370 @@ static int convert_speed(int kts) {
 // Show the currently captured interactive data on screen.
 //
 
+// Ownship input state for viewadsb
+static char ownship_input[16];      // Buffer for ownship input
+static int ownship_input_len = 0;   // Current input length
+static int ownship_input_active = 0; // 1 if currently entering ownship
+
+// Local ownship tracking for viewadsb
+static uint32_t viewadsb_ownship_hex = 0;
+static char viewadsb_ownship_callsign[9] = "";
+
+// Check if aircraft matches the local viewadsb ownship
+static int isOwnship(struct aircraft *a) {
+    // Check by hex ID (mask off non-ICAO address flag)
+    if (viewadsb_ownship_hex != 0 && (a->addr & 0xFFFFFF) == viewadsb_ownship_hex) {
+        return 1;
+    }
+    // Check by callsign (case-insensitive, handle trailing spaces)
+    if (viewadsb_ownship_callsign[0] != '\0') {
+        char callsign[9];
+        strncpy(callsign, a->callsign, 8);
+        callsign[8] = '\0';
+        // Trim trailing spaces
+        for (int i = 7; i >= 0 && callsign[i] == ' '; i--) {
+            callsign[i] = '\0';
+        }
+        if (strcasecmp(callsign, viewadsb_ownship_callsign) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Set ownship from input string (hex or callsign)
+static void setOwnshipFromInput(const char *input) {
+    if (!input || input[0] == '\0') {
+        // Clear ownship
+        viewadsb_ownship_hex = 0;
+        viewadsb_ownship_callsign[0] = '\0';
+        // Send clear to server
+        if (Modes.net_connectors_count > 0 && Modes.net_connectors[0].connected) {
+            sendOwnshipCommand(Modes.net_connectors[0].fd, 'X', NULL);
+        }
+        return;
+    }
+
+    // Check if input looks like hex (1-6 hex characters)
+    int is_hex = 1;
+    int len = strlen(input);
+    if (len > 6) is_hex = 0;
+    for (int i = 0; i < len && is_hex; i++) {
+        char c = input[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            is_hex = 0;
+        }
+    }
+
+    if (is_hex && len <= 6) {
+        // Treat as hex ID
+        viewadsb_ownship_hex = (uint32_t)strtol(input, NULL, 16);
+        viewadsb_ownship_callsign[0] = '\0';
+        // Send to server
+        if (Modes.net_connectors_count > 0 && Modes.net_connectors[0].connected) {
+            sendOwnshipCommand(Modes.net_connectors[0].fd, 'H', input);
+        }
+    } else {
+        // Treat as callsign
+        viewadsb_ownship_hex = 0;
+        strncpy(viewadsb_ownship_callsign, input, 8);
+        viewadsb_ownship_callsign[8] = '\0';
+        // Convert to uppercase
+        for (int i = 0; viewadsb_ownship_callsign[i]; i++) {
+            if (viewadsb_ownship_callsign[i] >= 'a' && viewadsb_ownship_callsign[i] <= 'z') {
+                viewadsb_ownship_callsign[i] -= 32;
+            }
+        }
+        // Send to server
+        if (Modes.net_connectors_count > 0 && Modes.net_connectors[0].connected) {
+            sendOwnshipCommand(Modes.net_connectors[0].fd, 'C', viewadsb_ownship_callsign);
+        }
+    }
+}
+
+// Initialize ownship from command line (called after connection established)
+// This is called periodically to handle reconnections
+void interactiveSendOwnship(void) {
+    if (!Modes.viewadsb) return;
+
+    // Rate limit: only send every 5 seconds
+    static int64_t last_send = 0;
+    int64_t now = mstime();
+    if (now - last_send < 5000) return;
+    last_send = now;
+
+    // Check if we have an active connection
+    if (Modes.net_connectors_count == 0) return;
+    struct net_connector *con = &Modes.net_connectors[0];
+    if (!con->connected || con->fd < 0) return;
+
+    // Check if ownship was set (either from command line or runtime input)
+    if (viewadsb_ownship_hex != 0) {
+        char hexstr[8];
+        snprintf(hexstr, sizeof(hexstr), "%06X", viewadsb_ownship_hex);
+        sendOwnshipCommand(con->fd, 'H', hexstr);
+    } else if (viewadsb_ownship_callsign[0] != '\0') {
+        sendOwnshipCommand(con->fd, 'C', viewadsb_ownship_callsign);
+    }
+    // If neither is set, check if command line had one (first-time setup)
+    else if (Modes.ownship_hex != 0) {
+        viewadsb_ownship_hex = Modes.ownship_hex;
+        char hexstr[8];
+        snprintf(hexstr, sizeof(hexstr), "%06X", Modes.ownship_hex);
+        sendOwnshipCommand(con->fd, 'H', hexstr);
+    } else if (Modes.ownship_callsign[0] != '\0') {
+        strncpy(viewadsb_ownship_callsign, Modes.ownship_callsign, 8);
+        viewadsb_ownship_callsign[8] = '\0';
+        sendOwnshipCommand(con->fd, 'C', viewadsb_ownship_callsign);
+    }
+}
+
 void interactiveInit() {
     if (!Modes.interactive)
         return;
 
     initscr();
+    // Initialize color support
+    if (has_colors()) {
+        start_color();
+        use_default_colors();  // Allow -1 for default background
+        // Define color pairs: pair number, foreground, background
+        init_pair(1, COLOR_MAGENTA, -1);  // Magenta on default background
+        init_pair(2, COLOR_GREEN, -1);    // Green on default background
+        init_pair(3, COLOR_CYAN, -1);     // Cyan on default background (ownship)
+    }
+
+    // Enable non-blocking keyboard input
+    nodelay(stdscr, TRUE);
+    keypad(stdscr, TRUE);
+    noecho();  // Don't echo typed characters
+
     clear();
     refresh();
-
 }
 
+// Print a single aircraft row with colors
+// Returns 1 if printed, 0 if skipped
+static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_ownship) {
+    if (!a) return 0;
+    if ((now - a->seen) >= Modes.interactive_display_ttl) return 0;
+
+    int msgs = a->messages;
+    if (msgs <= 1) return 0;
+
+    char strSquawk[5] = " ";
+    char strFl[7] = " ";
+    char strGPSAlt[7] = " ";
+    char strBaroRate[6] = " ";
+    char strGeomRate[6] = " ";
+    char strQNH[5] = " ";
+    char strSelAlt[6] = " ";
+    char strSelHdg[4] = " ";
+    char strAPMode[13] = " ";
+    char strCategory[3] = " ";
+    char strTt[5] = " ";
+    char strMagHdg[5] = " ";
+    char strGs[5] = " ";
+    char strIAS[5] = " ";
+    char strTAS[5] = " ";
+    char strMach[5] = " ";
+    char strTrackRate[5] = " ";
+    char strRoll[6] = " ";
+    char strOAT[5] = " ";
+    char strTAT[5] = " ";
+    char strWS[5] = " ";
+    char strWD[5] = " ";
+    char strNIC[4] = " ";
+    char strNACp[5] = " ";
+
+    if (trackDataValid(&a->squawk_valid)) {
+        snprintf(strSquawk, 5, "%04x", a->squawk);
+    }
+
+    // ADS-B emitter category (A0-D7)
+    if (a->category != 0) {
+        snprintf(strCategory, 3, "%c%d",
+                 'A' + ((a->category >> 4) - 0xA),
+                 a->category & 0x0F);
+    }
+
+    if (trackDataValid(&a->gs_valid)) {
+        snprintf(strGs, 5, "%3d", convert_speed(a->gs));
+    }
+
+    if (trackDataValid(&a->ias_valid)) {
+        snprintf(strIAS, 5, "%3d", convert_speed(a->ias));
+    }
+
+    if (trackDataValid(&a->tas_valid)) {
+        snprintf(strTAS, 5, "%3d", convert_speed(a->tas));
+    }
+
+    if (a->oat != 0.0) {
+        snprintf(strOAT, 5, "%3.0f", a->oat);
+    }
+
+    if (a->tat != 0.0) {
+        snprintf(strTAT, 5, "%3.0f", a->tat);
+    }
+
+    // NIC (Navigation Integrity Category) - from last computed position
+    if (trackDataValid(&a->position_valid)) {
+        snprintf(strNIC, 4, "%3u", a->pos_nic);
+    }
+
+    // NACp (Navigation Accuracy Category - Position)
+    if (trackDataValid(&a->nac_p_valid)) {
+        snprintf(strNACp, 5, "%4u", a->nac_p);
+    }
+
+    float windage_secs = (now - a->wind_updated)/1000;
+    if (windage_secs < 10.0) {
+        snprintf(strWS, 5, "%3.0f", a->wind_speed);
+        snprintf(strWD, 5, "%3.0f", a->wind_direction);
+    } else {
+        strncpy(strWS, "  \0", 3);
+        strncpy(strWD, "  \0", 3);
+    }
+
+    if (trackDataValid(&a->mach_valid)) {
+        snprintf(strMach, 5, "%01.3f", a->mach);
+    }
+
+    if (trackDataValid(&a->track_valid)) {
+        snprintf(strTt, 5, "%03.0f", a->track);
+    }
+
+    // Magnetic heading
+    if (trackDataValid(&a->mag_heading_valid)) {
+        snprintf(strMagHdg, 5, "%03.0f", a->mag_heading);
+    }
+
+    if (trackDataValid(&a->track_rate_valid)) {
+        snprintf(strTrackRate, 5, "%4.1f", a->track_rate);
+    }
+
+    // Roll angle (positive = right wing down)
+    if (trackDataValid(&a->roll_valid)) {
+        snprintf(strRoll, 6, "%5.1f", a->roll);
+    }
+
+    if (msgs > 99999) {
+        msgs = 0;
+    }
+
+    char strMode[5] = " ";
+    char strLat[8] = " ";
+    char strLon[9] = " ";
+    double * pSig = a->signalLevel;
+    double signalAverage = (pSig[0] + pSig[1] + pSig[2] + pSig[3] +
+            pSig[4] + pSig[5] + pSig[6] + pSig[7]) / 8.0;
+
+    strMode[0] = 'S';
+    if (a->modeA_hit) {
+        strMode[0] = 'a';
+    }
+    if (a->modeC_hit) {
+        strMode[0] = 'c';
+    }
+
+    if (trackDataValid(&a->position_valid)) {
+        snprintf(strLat, 8, "%7.03f", a->lat);
+        snprintf(strLon, 9, "%8.03f", a->lon);
+    }
+
+    if (trackDataValid(&a->airground_valid) && a->airground == AG_GROUND) {
+        snprintf(strFl, 7, " grnd");
+    } else if (Modes.use_gnss && trackDataValid(&a->geom_alt_valid)) {
+        snprintf(strFl, 7, "%5dH", convert_altitude(a->geom_alt));
+    } else if (trackDataValid(&a->baro_alt_valid)) {
+        snprintf(strFl, 7, "%5d ", convert_altitude(a->baro_alt));
+    }
+
+    if (trackDataValid(&a->geom_alt_valid)) {
+        snprintf(strGPSAlt, 7, "%5d", convert_altitude(a->geom_alt));
+    }
+
+    // Barometric vertical rate (fpm)
+    if (trackDataValid(&a->baro_rate_valid)) {
+        snprintf(strBaroRate, 6, "%5d", a->baro_rate);
+    }
+
+    // Geometric vertical rate (fpm)
+    if (trackDataValid(&a->geom_rate_valid)) {
+        snprintf(strGeomRate, 6, "%5d", a->geom_rate);
+    }
+
+    // QNH (altimeter setting in millibars)
+    if (trackDataValid(&a->nav_qnh_valid)) {
+        snprintf(strQNH, 5, "%4.0f", a->nav_qnh);
+    }
+
+    // Selected altitude (prefer MCP, fallback to FMS)
+    if (trackDataValid(&a->nav_altitude_mcp_valid)) {
+        snprintf(strSelAlt, 6, "%5d", a->nav_altitude_mcp);
+    } else if (trackDataValid(&a->nav_altitude_fms_valid)) {
+        snprintf(strSelAlt, 6, "%5d", a->nav_altitude_fms);
+    }
+
+    // Selected heading
+    if (trackDataValid(&a->nav_heading_valid)) {
+        snprintf(strSelHdg, 4, "%3.0f", a->nav_heading);
+    }
+
+    // Autopilot modes: AP=Autopilot, Vn=VNAV, Ah=AltHold, Ap=aPProach, Ln=LNAV, Tc=TCAS
+    if (trackDataValid(&a->nav_modes_valid)) {
+        int idx = 0;
+        if (a->nav_modes & NAV_MODE_AUTOPILOT) { strAPMode[idx++] = 'A'; strAPMode[idx++] = 'P'; }
+        if (a->nav_modes & NAV_MODE_VNAV)      { strAPMode[idx++] = 'V'; strAPMode[idx++] = 'n'; }
+        if (a->nav_modes & NAV_MODE_ALT_HOLD)  { strAPMode[idx++] = 'A'; strAPMode[idx++] = 'h'; }
+        if (a->nav_modes & NAV_MODE_APPROACH)  { strAPMode[idx++] = 'A'; strAPMode[idx++] = 'p'; }
+        if (a->nav_modes & NAV_MODE_LNAV)      { strAPMode[idx++] = 'L'; strAPMode[idx++] = 'n'; }
+        if (a->nav_modes & NAV_MODE_TCAS)      { strAPMode[idx++] = 'T'; strAPMode[idx++] = 'c'; }
+        strAPMode[idx] = '\0';
+    }
+
+    // Print row with colors
+    move(row, 0);
+
+    // Ownship: Cyan for Hex and Flight ID
+    if (is_ownship && has_colors()) {
+        attron(COLOR_PAIR(3));
+        printw("%s%06X", (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : " ", (a->addr & 0xffffff));
+        attroff(COLOR_PAIR(3));
+        printw(" %s  %-4s  ", strMode, strSquawk);
+        attron(COLOR_PAIR(3));
+        printw("%-8s", a->callsign);
+        attroff(COLOR_PAIR(3));
+        printw(" %2s ", strCategory);
+    } else {
+        // Normal: White for Hex, Mode, Sqwk, Flight, Category
+        printw("%s%06X %s  %-4s  %-8s %2s ",
+               (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : " ", (a->addr & 0xffffff),
+               strMode, strSquawk, a->callsign, strCategory);
+    }
+
+    // Magenta: APMode, QNH, SelAlt, SelHdg
+    if (has_colors()) attron(COLOR_PAIR(1));
+    printw("%-12s %4s %5s   %3s", strAPMode, strQNH, strSelAlt, strSelHdg);
+    if (has_colors()) attroff(COLOR_PAIR(1));
+
+    // White: BaroAlt, BaRt, GPSAlt, GmRt, GSP, IAS, TAS, Mach
+    printw(" %6s %5s %6s %5s  %3s  %3s  %3s  %4s  ",
+           strFl, strBaroRate, strGPSAlt, strGeomRate, strGs, strIAS, strTAS, strMach);
+
+    // Green: OAT, TAT, WD, WS
+    if (has_colors()) attron(COLOR_PAIR(2));
+    printw("%3s  %3s  %3s  %3s", strOAT, strTAT, strWD, strWS);
+    if (has_colors()) attroff(COLOR_PAIR(2));
+
+    // White: Ttk, MHd, TkR, Roll, Lat, Long, NIC, NACp, RSSI, Msgs, Ti
+    printw("  %3s  %3s  %4s %5s %7s %8s %3s %4s %5.1f %5d %2.0f",
+           strTt, strMagHdg, strTrackRate, strRoll,
+           strLat, strLon, strNIC, strNACp, 10 * log10(signalAverage), msgs, (now - a->seen) / 1000.0);
+
+    return 1;
+}
 void interactiveCleanup(void) {
     if (Modes.interactive) {
         endwin();
@@ -167,7 +521,7 @@ void interactiveShowData(void) {
     static int64_t next_clear;
     int64_t now = mstime();
     char progress;
-    char spinner[5] = "|/-\\";
+    char spinner[4] = "|/-\\";
 
     // Refresh screen every (MODES_INTERACTIVE_REFRESH_TIME) miliseconde
     if (now < next_update)
@@ -175,25 +529,32 @@ void interactiveShowData(void) {
 
     next_update = now + MODES_INTERACTIVE_REFRESH_TIME;
 
-    if (!next_clear) {
-        next_clear = now + 1500;
+    // Periodically send ownship to server (viewadsb only)
+    if (Modes.viewadsb) {
+        interactiveSendOwnship();
     }
-    // clear potential errors every 10 seconds
+
+    // clear potential errors every 2 seconds
     if (now > next_clear) {
-        next_clear = now + 10 * SECONDS;
+        next_clear = now + 2 * SECONDS;
         clear();
-        // print header
-        if (Modes.userLocationValid) {
-            mvprintw(0, 0, " Hex    Mode  Sqwk  Flight     Alt   Spd  Hdg     Dist      Dir  RSSI  Msgs Seen");
-        } else {
-            mvprintw(0, 0, " Hex    Mode  Sqwk  Flight     Alt   Spd  Hdg      Lat     Long  RSSI  Msgs Seen");
-        }
-        mvhline(1, 0, ACS_HLINE, 80);
+        // print header with colors matching data columns
+        move(0, 0);
+        printw(" Hex    M  Sqwk  Flight   Ct ");
+        if (has_colors()) attron(COLOR_PAIR(1));
+        printw("APMode        QNH SelAl SelHd");
+        if (has_colors()) attroff(COLOR_PAIR(1));
+        printw(" BaroAlt  BaRt GPSAlt  GmRt  GSP  IAS  TAS  Mach  ");
+        if (has_colors()) attron(COLOR_PAIR(2));
+        printw("OAT  TAT  WD   WS");
+        if (has_colors()) attroff(COLOR_PAIR(2));
+        printw("  Ttk  MHd  TkR  Roll   Lat      Long   NIC NACp  RSSI  Msgs  Ti");
+        mvhline(1, 0, ACS_HLINE, 193);
     }
 
 
     progress = spinner[(now / 1000) % 4];
-    mvaddch(0, 0, progress);
+    mvaddch(0, 193, progress);
 
     int rows = getmaxy(stdscr);
     int row = 2;
@@ -201,92 +562,43 @@ void interactiveShowData(void) {
     struct craftArray *ca = &Modes.aircraftActive;
 
     // sort active list by altitude
-    static int64_t next_sort;
-    if (now > next_sort) {
-        next_sort = now + 3 * SECONDS;
-        pthread_mutex_lock(&ca->change_mutex);
-        pthread_mutex_lock(&ca->write_mutex);
-        if (Modes.userLocationValid) {
-            qsort(ca->list, ca->len, sizeof(struct aircraft *), compareDist);
-        } else {
-            qsort(ca->list, ca->len, sizeof(struct aircraft *), compareAlt);
-        }
-        pthread_mutex_unlock(&ca->write_mutex);
-        pthread_mutex_unlock(&ca->change_mutex);
-    }
+    /*
+    pthread_mutex_lock(&ca->change_mutex);
+    pthread_mutex_lock(&ca->write_mutex);
+    qsort(ca->list, ca->len, sizeof(struct aircraft *), compareAlt);
+    pthread_mutex_unlock(&ca->write_mutex);
+    pthread_mutex_unlock(&ca->change_mutex);
+    */
 
     ca_lock_read(ca);
+
+    // Find and print ownship first (viewadsb mode only)
+    struct aircraft *ownship_printed = NULL;
+    if (Modes.viewadsb && (viewadsb_ownship_hex != 0 || viewadsb_ownship_callsign[0] != '\0')) {
+        for (int i = 0; i < ca->len; i++) {
+            struct aircraft *a = ca->list[i];
+            if (a && isOwnship(a)) {
+                if (printAircraftRow(a, row, now, 1)) {
+                    row++;
+                    ownship_printed = a;
+                }
+                break;
+            }
+        }
+    }
+
+    // Print all other aircraft
     for (int i = 0; i < ca->len; i++) {
         struct aircraft *a = ca->list[i];
 
         if (a && row < rows) {
+            // Skip ownship if already printed first
+            if (a == ownship_printed) continue;
 
-            if ((now - a->seen) < Modes.interactive_display_ttl) {
-                int msgs = a->messages;
-
-                if (msgs > 1) {
-                    char strSquawk[5] = " ";
-                    char strFl[7] = " ";
-                    char strTt[5] = " ";
-                    char strGs[6] = " ";
-
-                    if (trackDataValid(&a->squawk_valid)) {
-                        snprintf(strSquawk, 5, "%04x", a->squawk);
-                    }
-
-                    if (trackDataValid(&a->gs_valid)) {
-                        snprintf(strGs, 6, "%4d", convert_speed(a->gs));
-                    }
-
-                    if (trackDataValid(&a->track_valid)) {
-                        snprintf(strTt, 5, "%03.0f", a->track);
-                    }
-
-                    if (msgs > 99999) {
-                        msgs = 99999;
-                    }
-
-                    char strMode[5] = "    ";
-                    char strLat[8] = " ";
-                    char strLon[9] = " ";
-                    double * pSig = a->signalLevel;
-                    double signalAverage = (pSig[0] + pSig[1] + pSig[2] + pSig[3] +
-                            pSig[4] + pSig[5] + pSig[6] + pSig[7]) / 8.0;
-
-                    strMode[0] = 'S';
-                    if (a->modeA_hit) {
-                        strMode[2] = 'a';
-                    }
-                    if (a->modeC_hit) {
-                        strMode[3] = 'c';
-                    }
-
-                    if (trackDataValid(&a->position_valid)) {
-                        if (Modes.userLocationValid) {
-                            snprintf(strLat, 8, "%7.01f", convert_distance(a->receiver_distance));
-                            snprintf(strLon, 9, "%8.00f", a->receiver_direction);
-                        } else {
-                            snprintf(strLat, 8, "%7.03f", a->lat);
-                            snprintf(strLon, 9, "%8.03f", a->lon);
-                        }
-                    }
-
-                    if (trackDataValid(&a->airground_valid) && a->airground == AG_GROUND) {
-                        snprintf(strFl, 7, " grnd ");
-                    } else if (Modes.use_gnss && trackDataValid(&a->geom_alt_valid)) {
-                        snprintf(strFl, 7, "%5dH", convert_altitude(a->geom_alt));
-                    } else if (trackDataValid(&a->baro_alt_valid)) {
-                        snprintf(strFl, 7, "%5d ", convert_altitude(a->baro_alt));
-                    }
-
-                    mvprintw(row, 0, "%s%06X %-4s  %-4s  %-8s %6s %4s  %3s  %7s %8s %5.1f %5d   %2.0f",
-                            (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : " ", (a->addr & 0xffffff),
-                            strMode, strSquawk, a->callsign, strFl, strGs, strTt,
-                            strLat, strLon, 10 * log10(signalAverage), msgs, (now - a->seen) / 1000.0);
-                    ++row;
-                }
+            int is_own = Modes.viewadsb ? isOwnship(a) : 0;
+            if (printAircraftRow(a, row, now, is_own)) {
+                row++;
             }
-            a = a->next;
         }
     }
     ca_unlock_read(ca);
@@ -323,8 +635,73 @@ void interactiveShowData(void) {
         }
     }
 
+    // Handle keyboard input for ownship (viewadsb only)
+    if (Modes.viewadsb) {
+        int ch;
+        while ((ch = getch()) != ERR) {
+            if (ch == 27) {  // ESC key - cancel input
+                ownship_input_len = 0;
+                ownship_input[0] = '\0';
+                ownship_input_active = 0;
+            } else if (ch == '\n' || ch == '\r') {  // Enter - submit
+                if (ownship_input_len > 0) {
+                    ownship_input[ownship_input_len] = '\0';
+                    setOwnshipFromInput(ownship_input);
+                } else {
+                    // Empty input clears ownship
+                    setOwnshipFromInput(NULL);
+                }
+                ownship_input_len = 0;
+                ownship_input[0] = '\0';
+                ownship_input_active = 0;
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
+                if (ownship_input_len > 0) {
+                    ownship_input_len--;
+                    ownship_input[ownship_input_len] = '\0';
+                }
+                if (ownship_input_len == 0) {
+                    ownship_input_active = 0;
+                }
+            } else if (ch >= 32 && ch < 127 && ownship_input_len < 15) {  // Printable char
+                ownship_input[ownship_input_len++] = (char)ch;
+                ownship_input[ownship_input_len] = '\0';
+                ownship_input_active = 1;
+            }
+        }
+    }
+
     move(row, 0);
     clrtobot();
+
+    // Display ownship status/input at bottom of screen (viewadsb only)
+    if (Modes.viewadsb) {
+        int bottom_row = getmaxy(stdscr) - 1;
+        move(bottom_row, 0);
+        clrtoeol();
+
+        if (ownship_input_active) {
+            // Show input prompt
+            if (has_colors()) attron(COLOR_PAIR(3));
+            printw("Ownship: %s_", ownship_input);
+            if (has_colors()) attroff(COLOR_PAIR(3));
+            printw("  (Enter=set, ESC=cancel, Backspace=delete)");
+        } else if (viewadsb_ownship_hex != 0) {
+            // Show current ownship hex
+            if (has_colors()) attron(COLOR_PAIR(3));
+            printw("Ownship: %06X", viewadsb_ownship_hex);
+            if (has_colors()) attroff(COLOR_PAIR(3));
+            printw("  (type to change, Enter=clear)");
+        } else if (viewadsb_ownship_callsign[0] != '\0') {
+            // Show current ownship callsign
+            if (has_colors()) attron(COLOR_PAIR(3));
+            printw("Ownship: %s", viewadsb_ownship_callsign);
+            if (has_colors()) attroff(COLOR_PAIR(3));
+            printw("  (type to change, Enter=clear)");
+        } else {
+            printw("Type hex ID or callsign to set ownship");
+        }
+    }
+
     refresh();
 }
 

@@ -3772,6 +3772,47 @@ void sendBeastSettings(int fd, const char *settings) {
     anetWrite(fd, buf, len);
 }
 
+// Send ownship command to readsb server
+// type: 'H' for hex, 'C' for callsign, 'X' to clear
+// value: hex string (6 chars) or callsign (8 chars) or NULL for clear
+void sendOwnshipCommand(int fd, char type, const char *value) {
+    char buf[12];  // 0x1a + O + type + up to 8 chars + padding
+    char *p = buf;
+
+    *p++ = 0x1a;
+    *p++ = 'O';
+    *p++ = type;
+
+    if (type == 'X') {
+        // Clear command - just 3 bytes
+        anetWrite(fd, buf, 3);
+    } else if (type == 'H') {
+        // Hex command - pad to 6 chars
+        int i;
+        for (i = 0; i < 6 && value && value[i]; i++) {
+            *p++ = value[i];
+        }
+        // Pad with zeros
+        while (i < 6) {
+            *p++ = '0';
+            i++;
+        }
+        anetWrite(fd, buf, 9);  // 0x1a + O + H + 6 hex chars
+    } else if (type == 'C') {
+        // Callsign command - pad to 8 chars
+        int i;
+        for (i = 0; i < 8 && value && value[i]; i++) {
+            *p++ = value[i];
+        }
+        // Pad with spaces
+        while (i < 8) {
+            *p++ = ' ';
+            i++;
+        }
+        anetWrite(fd, buf, 11);  // 0x1a + O + C + 8 callsign chars
+    }
+}
+
 static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struct messageBuffer *mb) {
     MODES_NOTUSED(c);
     MODES_NOTUSED(remote);
@@ -3938,6 +3979,54 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
         switch (p[1]) {
             case 'S':
                 dropHalfUntil(now, c, now + PING_REDUCE_DURATION);
+                break;
+        }
+    } else if (p[0] == 'O') {
+        // Ownship command from viewadsb client
+        // Format: OH<hex> for hex ID, OC<callsign> for callsign, OX to clear
+        switch (p[1]) {
+            case 'H':
+                // Set ownship by hex ID
+                {
+                    char hexstr[8];
+                    int i;
+                    for (i = 0; i < 6 && p[2+i] && p[2+i] != ' '; i++) {
+                        hexstr[i] = p[2+i];
+                    }
+                    hexstr[i] = '\0';
+                    if (i > 0) {
+                        Modes.ownship_hex = (uint32_t)strtol(hexstr, NULL, 16);
+                        Modes.ownship_callsign[0] = '\0';
+                        fprintf(stderr, "Ownship set by client to hex: %06X\n", Modes.ownship_hex);
+                    }
+                }
+                break;
+            case 'C':
+                // Set ownship by callsign
+                {
+                    char callsign[9];
+                    int i;
+                    for (i = 0; i < 8 && p[2+i] && p[2+i] != ' ' && p[2+i] != '\n'; i++) {
+                        callsign[i] = p[2+i];
+                        // Convert to uppercase
+                        if (callsign[i] >= 'a' && callsign[i] <= 'z') {
+                            callsign[i] -= 32;
+                        }
+                    }
+                    callsign[i] = '\0';
+                    if (i > 0) {
+                        Modes.ownship_hex = 0;
+                        strncpy(Modes.ownship_callsign, callsign, 8);
+                        Modes.ownship_callsign[8] = '\0';
+                        fprintf(stderr, "Ownship set by client to callsign: %s\n", Modes.ownship_callsign);
+                    }
+                }
+                break;
+            case 'X':
+                // Clear ownship
+                Modes.ownship_hex = 0;
+                Modes.ownship_callsign[0] = '\0';
+                fprintf(stderr, "Ownship cleared by client\n");
                 break;
         }
     }
@@ -4827,6 +4916,22 @@ static int readBeastcommand(struct client *c, int64_t now, struct messageBuffer 
             eom = p + 2;
         } else if (*p == 'P') { // ping from the receiver
             eom = p + 4;
+        } else if (*p == 'O') { // Ownship command from viewadsb
+            // Format: OH<6 hex chars> or OC<8 callsign chars> or OX
+            if (p + 1 >= c->eod) {
+                break; // need more data
+            }
+            if (*(p+1) == 'X') {
+                eom = p + 2;  // OX
+            } else if (*(p+1) == 'H') {
+                eom = p + 8;  // OH + 6 hex chars
+            } else if (*(p+1) == 'C') {
+                eom = p + 10; // OC + 8 callsign chars
+            } else {
+                // Invalid O command, skip
+                ++c->som;
+                continue;
+            }
         } else {
             // Not a valid beast command, skip 0x1a and try again
             ++c->som;
@@ -6384,5 +6489,1096 @@ void netDrainMessageBuffers() {
     for (int kt = 0; kt < Modes.decodeThreads; kt++) {
         struct messageBuffer *mb = &Modes.netMessageBuffer[kt];
         drainMessageBuffer(mb);
+    }
+}
+
+// ================================ EFB XGPS/XTRAFFIC UDP Output ================================
+//
+// Sends XGPS and XTRAFFIC packets to EFB apps (ForeFlight, etc.) for display on iOS devices
+// Reference: https://www.foreflight.com/support/network-gps
+//
+// XGPS format (ownship): XGPSreadsb,<lon>,<lat>,<alt_m>,<track>,<gs_mps>
+// XTRAFFIC format (traffic): XTRAFFICreadsb,<id>,<lat>,<lon>,<alt_ft>,<vrate_fpm>,<airborne>,<track>,<speed_kts>,<callsign>
+
+static struct sockaddr_in efb_addr;
+
+void efbInit(void) {
+    // Check if either XGPS or XTRAFFIC is enabled
+    if ((!Modes.send_xgps && !Modes.send_xtraffic) || !Modes.efb_ip) {
+        Modes.efb_fd = -1;
+        return;
+    }
+
+    // Validate configuration
+    if (Modes.send_xgps && !Modes.ownship_hex && !Modes.ownship_callsign[0]) {
+        fprintf(stderr, "EFB: Warning: --sendxgps requires --ownship to identify ownship\n");
+    }
+
+    // Create UDP socket
+    Modes.efb_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (Modes.efb_fd < 0) {
+        fprintf(stderr, "EFB: Failed to create UDP socket: %s\n", strerror(errno));
+        return;
+    }
+
+    // Set up destination address
+    memset(&efb_addr, 0, sizeof(efb_addr));
+    efb_addr.sin_family = AF_INET;
+    efb_addr.sin_port = htons(Modes.efb_port);
+
+    // Resolve hostname/IP
+    struct hostent *he = gethostbyname(Modes.efb_ip);
+    if (he == NULL) {
+        fprintf(stderr, "EFB: Failed to resolve host '%s': %s\n",
+                Modes.efb_ip, hstrerror(h_errno));
+        close(Modes.efb_fd);
+        Modes.efb_fd = -1;
+        return;
+    }
+    memcpy(&efb_addr.sin_addr, he->h_addr_list[0], he->h_length);
+
+    Modes.efb_next_update = mono_milli_seconds();
+    fprintf(stderr, "EFB: XGPS/XTRAFFIC output initialized to %s:%d\n",
+            inet_ntoa(efb_addr.sin_addr), Modes.efb_port);
+}
+
+void efbClose(void) {
+    if (Modes.efb_fd >= 0) {
+        close(Modes.efb_fd);
+        Modes.efb_fd = -1;
+    }
+    sfree(Modes.efb_ip);
+}
+
+// Send a UDP packet to EFB
+static void efbSend(const char *data, int len) {
+    if (Modes.efb_fd < 0)
+        return;
+
+    ssize_t sent = sendto(Modes.efb_fd, data, len, 0,
+                          (struct sockaddr *)&efb_addr, sizeof(efb_addr));
+    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        static int64_t last_error = 0;
+        int64_t now = mstime();
+        // Rate limit error messages
+        if (now - last_error > 10000) {
+            fprintf(stderr, "EFB: UDP send error: %s\n", strerror(errno));
+            last_error = now;
+        }
+    }
+}
+
+// Check if an aircraft is the configured ownship (by hex ID or callsign)
+static int isOwnship(struct aircraft *a) {
+    if (!a) return 0;
+
+    // Check by hex ID if configured
+    if (Modes.ownship_hex && (a->addr == Modes.ownship_hex)) {
+        return 1;
+    }
+
+    // Check by callsign if configured
+    if (Modes.ownship_callsign[0] && a->callsign[0]) {
+        // Compare callsigns (case-insensitive, ignoring trailing spaces)
+        const char *cs1 = Modes.ownship_callsign;
+        const char *cs2 = a->callsign;
+        while (*cs1 && *cs2) {
+            char c1 = *cs1;
+            char c2 = *cs2;
+            // Convert to uppercase for comparison
+            if (c1 >= 'a' && c1 <= 'z') c1 -= 32;
+            if (c2 >= 'a' && c2 <= 'z') c2 -= 32;
+            if (c1 != c2) return 0;
+            cs1++;
+            cs2++;
+        }
+        // Handle trailing spaces - consider them equal
+        while (*cs1 == ' ') cs1++;
+        while (*cs2 == ' ') cs2++;
+        if (*cs1 == '\0' && *cs2 == '\0') {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// Check if ownship is configured (either by hex or callsign)
+static int hasOwnshipConfig(void) {
+    return Modes.ownship_hex || Modes.ownship_callsign[0];
+}
+
+// Helper function to send aircraft data via EFB protocol
+static void efbSendAircraft(struct aircraft *a, double feet_per_meter, double knots_to_mps) {
+    char buf[512];
+    int len;
+
+    // Get altitude - prefer barometric, fallback to geometric
+    int alt_valid = 0;
+    int altitude_ft = 0;
+    if (trackDataValid(&a->baro_alt_valid)) {
+        altitude_ft = a->baro_alt;
+        alt_valid = 1;
+    } else if (trackDataValid(&a->geom_alt_valid)) {
+        altitude_ft = a->geom_alt;
+        alt_valid = 1;
+    }
+
+    // Get track/heading
+    float track = 0;
+    if (trackDataValid(&a->track_valid)) {
+        track = a->track;
+    } else if (trackDataValid(&a->mag_heading_valid)) {
+        track = a->mag_heading;
+    }
+
+    // Get ground speed
+    float gs_kts = 0;
+    int gs_valid = 0;
+    if (trackDataValid(&a->gs_valid)) {
+        gs_kts = a->gs;
+        gs_valid = 1;
+    }
+
+    // Get vertical rate - prefer barometric, fallback to geometric
+    int vrate_fpm = 0;
+    if (trackDataValid(&a->baro_rate_valid)) {
+        vrate_fpm = a->baro_rate;
+    } else if (trackDataValid(&a->geom_rate_valid)) {
+        vrate_fpm = a->geom_rate;
+    }
+
+    // Determine if airborne
+    int airborne = 1; // Default to airborne
+    if (trackDataValid(&a->airground_valid)) {
+        airborne = (a->airground == AG_AIRBORNE) ? 1 : 0;
+    }
+
+    // Get callsign
+    const char *callsign = a->callsign[0] ? a->callsign : "";
+
+    // Check if this is the ownship
+    if (isOwnship(a)) {
+        // Send XGPS packet for ownship (if enabled)
+        if (Modes.send_xgps) {
+            // Format: XGPSreadsb,<lon>,<lat>,<alt_m>,<track>,<gs_mps>
+            // Note: XGPS uses meters for altitude and m/s for speed
+
+            double alt_meters = alt_valid ? (altitude_ft / feet_per_meter) : 0;
+            double gs_mps = gs_valid ? (gs_kts * knots_to_mps) : 0;
+
+            len = snprintf(buf, sizeof(buf),
+                          "XGPSreadsb,%.4f,%.4f,%.1f,%.1f,%.1f\n",
+                          a->lon, a->lat, alt_meters, track, gs_mps);
+
+            if (len > 0 && len < (int)sizeof(buf)) {
+                efbSend(buf, len);
+            }
+        }
+    } else {
+        // Send XTRAFFIC packet for traffic (if enabled)
+        if (Modes.send_xtraffic) {
+            // Format: XTRAFFICreadsb,<id>,<lat>,<lon>,<alt_ft>,<vrate_fpm>,<airborne>,<track>,<speed_kts>,<callsign>
+            // Note: XTRAFFIC uses feet for altitude and knots for speed
+
+            len = snprintf(buf, sizeof(buf),
+                          "XTRAFFICreadsb,%u,%.4f,%.4f,%.1f,%.1f,%d,%.1f,%.1f,%s\n",
+                          a->addr,
+                          a->lat, a->lon,
+                          (double)altitude_ft,
+                          (double)vrate_fpm,
+                          airborne,
+                          track,
+                          gs_kts,
+                          callsign);
+
+            if (len > 0 && len < (int)sizeof(buf)) {
+                efbSend(buf, len);
+            }
+        }
+    }
+}
+
+void efbPeriodicWork(void) {
+    if (Modes.efb_fd < 0)
+        return;
+
+    if (!Modes.send_xgps && !Modes.send_xtraffic)
+        return;
+
+    int64_t mono = mono_milli_seconds();
+    if (mono < Modes.efb_next_update)
+        return;
+
+    // Send updates at 1Hz as per ForeFlight spec
+    Modes.efb_next_update = mono + 1000;
+
+    int64_t now = mstime();  // Use mstime() for aircraft timestamp comparisons
+
+    // Constants for unit conversion
+    // Altitude: meters to feet (for XTRAFFIC)
+    // Speed: meters/sec (XGPS) vs knots (XTRAFFIC)
+    const double FEET_PER_METER = 3.28084;
+    const double KNOTS_TO_MPS = 0.514444;
+
+    // Iterate through all aircraft
+    // Use aircraftActive for synthetic mode (hash buckets not populated)
+    // Use hash buckets for normal mode (lock-free, better performance)
+    if (Modes.synthetic_now) {
+        struct craftArray *ca = &Modes.aircraftActive;
+        ca_lock_read(ca);
+        for (int i = 0; i < ca->len; i++) {
+            struct aircraft *a = ca->list[i];
+            if (!a) continue;
+
+            // Skip aircraft not seen recently (within last 60 seconds)
+            if (now > a->seen + 60 * SECONDS)
+                continue;
+
+            // Skip non-ICAO addresses
+            if (a->addr & MODES_NON_ICAO_ADDRESS)
+                continue;
+
+            // Need valid position
+            if (!trackDataValid(&a->position_valid))
+                continue;
+
+            efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+        }
+        ca_unlock_read(ca);
+    } else {
+        for (int j = 0; j < Modes.acBuckets; j++) {
+            for (struct aircraft *a = Modes.aircraft[j]; a; a = a->next) {
+                // Skip aircraft not seen recently (within last 60 seconds)
+                if (now > a->seen + 60 * SECONDS)
+                    continue;
+
+                // Skip non-ICAO addresses
+                if (a->addr & MODES_NON_ICAO_ADDRESS)
+                    continue;
+
+                // Need valid position
+                if (!trackDataValid(&a->position_valid))
+                    continue;
+
+                efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+            }
+        }
+    }
+}
+
+// ================================ GDL90 Protocol Output ================================
+//
+// GDL90 is a binary protocol for ADS-B data, used by devices like Sentry, Stratus, etc.
+// Reference: https://www.faa.gov/sites/faa.gov/files/air_traffic/technology/adsb/archival/GDL90_Public_ICD_RevA.PDF
+// ForeFlight extensions: https://www.foreflight.com/connect/spec/
+//
+// Key features:
+// - Binary protocol with byte-stuffing (0x7E flag bytes, 0x7D escape)
+// - CRC-CCITT checksum
+// - UDP port 4000 for data, port 63093 for EFB discovery
+//
+// Message types:
+// - 0: Heartbeat (status, timestamp)
+// - 10: Ownship Report (position, velocity)
+// - 11: Ownship Geometric Altitude
+// - 20: Traffic Report
+
+// GDL90 constants
+#define GDL90_FLAG_BYTE     0x7E
+#define GDL90_ESCAPE_BYTE   0x7D
+#define GDL90_ESCAPE_XOR    0x20
+
+#define GDL90_MSG_HEARTBEAT     0
+#define GDL90_MSG_OWNSHIP       10
+#define GDL90_MSG_OWNSHIP_ALT   11
+#define GDL90_MSG_TRAFFIC       20
+#define GDL90_MSG_FOREFLIGHT_ID 0x65
+
+#define GDL90_LISTEN_PORT       63093
+#define GDL90_SEND_PORT         4000
+#define GDL90_TARGET_TIMEOUT    15000  // 15 seconds (ForeFlight broadcasts every 5s)
+
+// CRC-CCITT lookup table
+static uint16_t gdl90_crc_table[256];
+static int gdl90_crc_table_initialized = 0;
+
+// Initialize CRC lookup table
+static void gdl90CrcInit(void) {
+    if (gdl90_crc_table_initialized)
+        return;
+
+    for (int i = 0; i < 256; i++) {
+        uint16_t crc = i << 8;
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
+        }
+        gdl90_crc_table[i] = crc;
+    }
+    gdl90_crc_table_initialized = 1;
+}
+
+// Calculate CRC-CCITT
+static uint16_t gdl90Crc(const uint8_t *data, int len) {
+    uint16_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc = gdl90_crc_table[crc >> 8] ^ (crc << 8) ^ data[i];
+    }
+    return crc;
+}
+
+// Byte-stuff a message and add framing
+// Returns length of stuffed message, or -1 if buffer too small
+static int gdl90Stuff(const uint8_t *msg, int msg_len, uint8_t *out, int out_size) {
+    // Calculate CRC on original message
+    uint16_t crc = gdl90Crc(msg, msg_len);
+
+    int out_idx = 0;
+
+    // Start flag
+    if (out_idx >= out_size) return -1;
+    out[out_idx++] = GDL90_FLAG_BYTE;
+
+    // Message content with byte-stuffing
+    for (int i = 0; i < msg_len; i++) {
+        uint8_t b = msg[i];
+        if (b == GDL90_FLAG_BYTE || b == GDL90_ESCAPE_BYTE) {
+            if (out_idx + 2 > out_size) return -1;
+            out[out_idx++] = GDL90_ESCAPE_BYTE;
+            out[out_idx++] = b ^ GDL90_ESCAPE_XOR;
+        } else {
+            if (out_idx >= out_size) return -1;
+            out[out_idx++] = b;
+        }
+    }
+
+    // CRC (LSB first) with byte-stuffing
+    uint8_t crc_lo = crc & 0xFF;
+    uint8_t crc_hi = (crc >> 8) & 0xFF;
+
+    if (crc_lo == GDL90_FLAG_BYTE || crc_lo == GDL90_ESCAPE_BYTE) {
+        if (out_idx + 2 > out_size) return -1;
+        out[out_idx++] = GDL90_ESCAPE_BYTE;
+        out[out_idx++] = crc_lo ^ GDL90_ESCAPE_XOR;
+    } else {
+        if (out_idx >= out_size) return -1;
+        out[out_idx++] = crc_lo;
+    }
+
+    if (crc_hi == GDL90_FLAG_BYTE || crc_hi == GDL90_ESCAPE_BYTE) {
+        if (out_idx + 2 > out_size) return -1;
+        out[out_idx++] = GDL90_ESCAPE_BYTE;
+        out[out_idx++] = crc_hi ^ GDL90_ESCAPE_XOR;
+    } else {
+        if (out_idx >= out_size) return -1;
+        out[out_idx++] = crc_hi;
+    }
+
+    // End flag
+    if (out_idx >= out_size) return -1;
+    out[out_idx++] = GDL90_FLAG_BYTE;
+
+    return out_idx;
+}
+
+// Convert latitude/longitude to 24-bit semicircle format
+static int32_t gdl90EncodeLatLon(double deg) {
+    // Range: +/- 180 degrees -> +/- 2^23
+    // Resolution: 180/2^23 degrees per LSB
+    double semicircles = deg * (double)(1 << 23) / 180.0;
+    int32_t encoded = (int32_t)semicircles;
+    // Mask to 24 bits (handle sign extension)
+    return encoded & 0xFFFFFF;
+}
+
+// Encode altitude for GDL90 (25-foot resolution, offset by 1000 feet)
+static uint16_t gdl90EncodeAltitude(int alt_ft) {
+    // Altitude = (encoded * 25) - 1000
+    // encoded = (altitude + 1000) / 25
+    int encoded = (alt_ft + 1000) / 25;
+    if (encoded < 0) encoded = 0;
+    if (encoded > 0xFFE) encoded = 0xFFE;
+    return (uint16_t)encoded;
+}
+
+// Convert ADS-B category to GDL90 emitter category
+// ADS-B category is encoded as 0xA0-0xA7, 0xB0-0xB7, 0xC0-0xC7, 0xD0-0xD7
+// GDL90 emitter category is 0-21
+static uint8_t gdl90ConvertCategory(uint32_t adsb_category) {
+    if (adsb_category == 0) {
+        return 0; // No category information
+    }
+
+    uint8_t set = (adsb_category >> 4) & 0x0F;  // A=0xA, B=0xB, C=0xC, D=0xD
+    uint8_t cat = adsb_category & 0x07;          // 0-7
+
+    switch (set) {
+        case 0x0A: // Set A - Aircraft
+            // A0=0 (no info), A1=1 (light), A2=2 (small), A3=3 (large),
+            // A4=4 (high vortex), A5=5 (heavy), A6=6 (high perf), A7=7 (rotorcraft)
+            return cat; // Direct mapping for Set A
+
+        case 0x0B: // Set B - Aircraft
+            switch (cat) {
+                case 0: return 0;  // No info
+                case 1: return 9;  // Glider/Sailplane
+                case 2: return 10; // Lighter-than-Air
+                case 3: return 11; // Parachutist/Skydiver
+                case 4: return 12; // Ultralight/Hang glider/Paraglider
+                case 5: return 0;  // Reserved
+                case 6: return 14; // UAV
+                case 7: return 15; // Space/Trans-atmospheric
+                default: return 0;
+            }
+
+        case 0x0C: // Set C - Ground vehicles and obstacles
+            switch (cat) {
+                case 0: return 0;  // No info
+                case 1: return 17; // Emergency Vehicle
+                case 2: return 18; // Service Vehicle
+                case 3: return 19; // Point Obstacle
+                case 4: return 20; // Cluster Obstacle
+                case 5: return 21; // Line Obstacle
+                default: return 0; // Reserved
+            }
+
+        case 0x0D: // Set D - Reserved
+            return 0;
+
+        default:
+            return 0;
+    }
+}
+
+// Build GDL90 Heartbeat message (Message ID 0)
+static int gdl90BuildHeartbeat(uint8_t *msg, int size) {
+    if (size < 7) return -1;
+
+    // Get current time
+    time_t now_t = time(NULL);
+    struct tm *utc = gmtime(&now_t);
+    uint32_t seconds_since_midnight = utc->tm_hour * 3600 + utc->tm_min * 60 + utc->tm_sec;
+
+    msg[0] = GDL90_MSG_HEARTBEAT;
+
+    // Status Byte 1
+    // Bit 7: GPS Pos Valid = 1 (we have position data)
+    // Bit 0: UAT Initialized = 1
+    msg[1] = 0x81;
+
+    // Status Byte 2
+    // Bit 7: Time Stamp MSB (bit 16)
+    // Bit 0: UTC OK = 1
+    msg[2] = ((seconds_since_midnight >> 16) & 0x01) ? 0x81 : 0x01;
+
+    // Time Stamp (bits 15-0, LSB first)
+    msg[3] = seconds_since_midnight & 0xFF;
+    msg[4] = (seconds_since_midnight >> 8) & 0xFF;
+
+    // Message counts (not used, set to 0)
+    msg[5] = 0;
+    msg[6] = 0;
+
+    return 7;
+}
+
+// Build GDL90 Ownship or Traffic Report (Message ID 10 or 20)
+static int gdl90BuildTrafficReport(uint8_t *msg, int size, struct aircraft *a, int is_ownship) {
+    if (size < 28) return -1;
+
+    msg[0] = is_ownship ? GDL90_MSG_OWNSHIP : GDL90_MSG_TRAFFIC;
+
+    // Traffic Alert Status (4 bits) + Address Type (4 bits)
+    // No alert, ICAO address
+    msg[1] = 0x00;
+
+    // Participant Address (24 bits, MSB first)
+    msg[2] = (a->addr >> 16) & 0xFF;
+    msg[3] = (a->addr >> 8) & 0xFF;
+    msg[4] = a->addr & 0xFF;
+
+    // Latitude (24 bits, MSB first)
+    int32_t lat_enc = gdl90EncodeLatLon(a->lat);
+    msg[5] = (lat_enc >> 16) & 0xFF;
+    msg[6] = (lat_enc >> 8) & 0xFF;
+    msg[7] = lat_enc & 0xFF;
+
+    // Longitude (24 bits, MSB first)
+    int32_t lon_enc = gdl90EncodeLatLon(a->lon);
+    msg[8] = (lon_enc >> 16) & 0xFF;
+    msg[9] = (lon_enc >> 8) & 0xFF;
+    msg[10] = lon_enc & 0xFF;
+
+    // Get altitude - prefer barometric, fallback to geometric
+    int altitude_ft = 0;
+    if (trackDataValid(&a->baro_alt_valid)) {
+        altitude_ft = a->baro_alt;
+    } else if (trackDataValid(&a->geom_alt_valid)) {
+        altitude_ft = a->geom_alt;
+    }
+    uint16_t alt_enc = gdl90EncodeAltitude(altitude_ft);
+
+    // Altitude (12 bits) + Misc (4 bits)
+    // Misc: bit 3 = airborne, bits 1-0 = track type (01 = true track)
+    int airborne = 1;
+    if (trackDataValid(&a->airground_valid)) {
+        airborne = (a->airground == AG_AIRBORNE) ? 1 : 0;
+    }
+    uint8_t misc = (airborne ? 0x08 : 0x00) | 0x01; // Airborne + True Track
+
+    msg[11] = (alt_enc >> 4) & 0xFF;
+    msg[12] = ((alt_enc & 0x0F) << 4) | (misc & 0x0F);
+
+    // NIC (4 bits) + NACp (4 bits)
+    // Use actual values from aircraft, with fallback to 0
+    uint8_t nic = 0;
+    uint8_t nacp = 0;
+
+    // Get NIC from position
+    if (trackDataValid(&a->position_valid) && a->pos_nic <= 15) {
+        nic = a->pos_nic;
+    }
+
+    // Get NACp
+    if (trackDataValid(&a->nac_p_valid) && a->nac_p <= 15) {
+        nacp = a->nac_p;
+    }
+
+    msg[13] = ((nic & 0x0F) << 4) | (nacp & 0x0F);
+
+    // Horizontal velocity (12 bits, MSB first)
+    int h_vel = 0;
+    if (trackDataValid(&a->gs_valid)) {
+        h_vel = (int)a->gs;
+        if (h_vel > 4094) h_vel = 4094;
+    }
+
+    // Get vertical rate - prefer barometric, fallback to geometric
+    int vrate_fpm = 0;
+    if (trackDataValid(&a->baro_rate_valid)) {
+        vrate_fpm = a->baro_rate;
+    } else if (trackDataValid(&a->geom_rate_valid)) {
+        vrate_fpm = a->geom_rate;
+    }
+
+    // Vertical velocity (12 bits, signed, 64 fpm resolution)
+    int v_vel = vrate_fpm / 64;
+    if (v_vel > 0x1FE) v_vel = 0x1FE;
+    if (v_vel < -0x1FE) v_vel = -0x1FE;
+    uint16_t v_vel_enc = v_vel & 0xFFF;
+
+    msg[14] = (h_vel >> 4) & 0xFF;
+    msg[15] = ((h_vel & 0x0F) << 4) | ((v_vel_enc >> 8) & 0x0F);
+    msg[16] = v_vel_enc & 0xFF;
+
+    // Track/Heading (8 bits, 360/256 degrees per LSB)
+    float track = 0;
+    if (trackDataValid(&a->track_valid)) {
+        track = a->track;
+    } else if (trackDataValid(&a->mag_heading_valid)) {
+        track = a->mag_heading;
+    }
+    uint8_t track_enc = (uint8_t)(track * 256.0 / 360.0);
+    msg[17] = track_enc;
+
+    // Emitter Category (8 bits)
+    // Convert from ADS-B category to GDL90 emitter category
+    msg[18] = gdl90ConvertCategory(a->category);
+
+    // Call Sign (8 bytes, space-padded ASCII)
+    memset(&msg[19], ' ', 8);
+    if (a->callsign[0]) {
+        int cs_len = strlen(a->callsign);
+        if (cs_len > 8) cs_len = 8;
+        memcpy(&msg[19], a->callsign, cs_len);
+    }
+
+    // Emergency/Priority Code (4 bits) + Spare (4 bits)
+    msg[27] = 0x00;
+
+    return 28;
+}
+
+// Build GDL90 Ownship Geometric Altitude message (Message ID 11)
+// Per GDL90 spec 3.8: Only output when geometric altitude is available
+static int gdl90BuildOwnshipAlt(uint8_t *msg, int size, struct aircraft *a) {
+    if (size < 5) return -1;
+
+    // Only send if we have valid geometric altitude
+    if (!trackDataValid(&a->geom_alt_valid)) {
+        return 0;  // Return 0 to indicate no message to send
+    }
+
+    msg[0] = GDL90_MSG_OWNSHIP_ALT;
+
+    // Geometric altitude (16-bit signed, 5-foot resolution)
+    // GDL90 spec: Geo Altitude (ft) = encoded_value * 5
+    int16_t alt_enc = a->geom_alt / 5;
+    msg[1] = (alt_enc >> 8) & 0xFF;  // MSB first (big-endian)
+    msg[2] = alt_enc & 0xFF;
+
+    // Vertical metrics (16 bits)
+    // Bit 15: Vertical warning (0 = no warning)
+    // Bits 14-0: VFOM in meters (0x7FFF = not available)
+    //
+    // GVA (Geometric Vertical Accuracy) from ADS-B:
+    //   0 = Unknown
+    //   1 = < 150 meters
+    //   2 = < 45 meters
+    //   3 = Reserved
+    //
+    // If GVA is not available, default to 45m (typical GPS accuracy)
+    // since ForeFlight may discard the altitude if VFOM is "not available"
+    uint16_t vfom = 45;  // Default: 45 meters (reasonable GPS accuracy)
+    if (trackDataValid(&a->gva_valid)) {
+        switch (a->gva) {
+            case 1:
+                vfom = 150;  // < 150 meters
+                break;
+            case 2:
+                vfom = 45;   // < 45 meters
+                break;
+            case 0:
+            case 3:
+            default:
+                // GVA 0 or 3: unknown/reserved, use default
+                vfom = 45;
+                break;
+        }
+    }
+
+    // Vertical warning bit is 0 (no warning), VFOM in bits 14-0
+    msg[3] = (vfom >> 8) & 0x7F;  // Clear bit 15 (no warning)
+    msg[4] = vfom & 0xFF;
+
+    return 5;
+}
+
+// Build ForeFlight ID message (Message ID 0x65, sub-ID 0)
+// If ownship is provided, use its callsign as the device name
+static int gdl90BuildForeFlightId(uint8_t *msg, int size, struct aircraft *ownship) {
+    if (size < 39) return -1;
+
+    msg[0] = GDL90_MSG_FOREFLIGHT_ID;
+    msg[1] = 0x00; // Sub-ID 0 (ID message)
+    msg[2] = 0x01; // Version 1
+
+    // Device serial number (8 bytes) - use 0xFFFFFFFFFFFFFFFF for invalid
+    memset(&msg[3], 0xFF, 8);
+
+    // Device name (8 bytes) - use ownship callsign if available
+    memset(&msg[11], ' ', 8);
+    if (ownship && ownship->callsign[0]) {
+        // Copy callsign, padding with spaces
+        int len = strlen(ownship->callsign);
+        if (len > 8) len = 8;
+        memcpy(&msg[11], ownship->callsign, len);
+    } else if (Modes.ownship_callsign[0]) {
+        // Use configured callsign
+        int len = strlen(Modes.ownship_callsign);
+        if (len > 8) len = 8;
+        memcpy(&msg[11], Modes.ownship_callsign, len);
+    } else {
+        memcpy(&msg[11], "readsb", 6);
+    }
+
+    // Device long name (16 bytes) - use ownship callsign + suffix if available
+    memset(&msg[19], ' ', 16);
+    if (ownship && ownship->callsign[0]) {
+        char longname[17];
+        snprintf(longname, sizeof(longname), "%-8s ADS-B", ownship->callsign);
+        memcpy(&msg[19], longname, 16);
+    } else if (Modes.ownship_callsign[0]) {
+        char longname[17];
+        snprintf(longname, sizeof(longname), "%-8s ADS-B", Modes.ownship_callsign);
+        memcpy(&msg[19], longname, 16);
+    } else {
+        memcpy(&msg[19], "readsb ADS-B", 12);
+    }
+
+    // Capabilities mask (4 bytes, big-endian)
+    // Bit 0 (LSB): Geo altitude datum (0 = WGS-84 ellipsoid/HAE, 1 = MSL)
+    // ADS-B geometric altitude is HAE (Height Above Ellipsoid), so we use 0
+    msg[35] = 0x00;
+    msg[36] = 0x00;
+    msg[37] = 0x00;
+    msg[38] = 0x00; // HAE altitude (WGS-84 ellipsoid per GDL90 spec)
+
+    return 39;
+}
+
+// Build ForeFlight AHRS message (Message ID 0x65, sub-ID 1)
+// Per ForeFlight spec, should be sent at 5Hz
+static int gdl90BuildAHRS(uint8_t *msg, int size, struct aircraft *a) {
+    if (size < 12) return -1;
+
+    msg[0] = GDL90_MSG_FOREFLIGHT_ID;
+    msg[1] = 0x01; // Sub-ID 1 (AHRS message)
+
+    // Roll (16-bit signed, 1/10 degree resolution)
+    // Positive = right wing down, Negative = right wing up
+    // 0x7FFF = invalid
+    int16_t roll_val = 0x7FFF;
+    if (a && trackDataValid(&a->roll_valid)) {
+        // a->roll is in degrees, convert to 1/10 degree
+        int roll_tenth = (int)(a->roll * 10.0);
+        if (roll_tenth >= -1800 && roll_tenth <= 1800) {
+            roll_val = (int16_t)roll_tenth;
+        }
+    }
+    msg[2] = (roll_val >> 8) & 0xFF;
+    msg[3] = roll_val & 0xFF;
+
+    // Pitch (16-bit signed, 1/10 degree resolution)
+    // Always invalid as we don't have pitch data from ADS-B
+    msg[4] = 0x7F;
+    msg[5] = 0xFF;
+
+    // Heading (16-bit)
+    // Bit 15: 0 = True heading, 1 = Magnetic heading
+    // Bits 14-0: Heading in 1/10 degree
+    // 0xFFFF = invalid
+    // Note: Track should NOT be used here per ForeFlight spec
+    uint16_t heading_val = 0xFFFF;
+    if (a && trackDataValid(&a->mag_heading_valid)) {
+        // Prefer magnetic heading
+        int hdg_tenth = (int)(a->mag_heading * 10.0);
+        if (hdg_tenth >= 0 && hdg_tenth <= 3600) {
+            heading_val = 0x8000 | (hdg_tenth & 0x7FFF); // Set bit 15 for magnetic
+        }
+    } else if (a && trackDataValid(&a->true_heading_valid)) {
+        // Fall back to true heading
+        int hdg_tenth = (int)(a->true_heading * 10.0);
+        if (hdg_tenth >= 0 && hdg_tenth <= 3600) {
+            heading_val = hdg_tenth & 0x7FFF; // Clear bit 15 for true
+        }
+    }
+    msg[6] = (heading_val >> 8) & 0xFF;
+    msg[7] = heading_val & 0xFF;
+
+    // Indicated Airspeed (16-bit unsigned, knots)
+    // 0xFFFF = invalid
+    uint16_t ias_val = 0xFFFF;
+    if (a && trackDataValid(&a->ias_valid)) {
+        if (a->ias <= 0xFFFE) {
+            ias_val = (uint16_t)a->ias;
+        }
+    }
+    msg[8] = (ias_val >> 8) & 0xFF;
+    msg[9] = ias_val & 0xFF;
+
+    // True Airspeed (16-bit unsigned, knots)
+    // 0xFFFF = invalid
+    uint16_t tas_val = 0xFFFF;
+    if (a && trackDataValid(&a->tas_valid)) {
+        if (a->tas <= 0xFFFE) {
+            tas_val = (uint16_t)a->tas;
+        }
+    }
+    msg[10] = (tas_val >> 8) & 0xFF;
+    msg[11] = tas_val & 0xFF;
+
+    return 12;
+}
+
+// Send a GDL90 message
+static void gdl90Send(const uint8_t *msg, int msg_len) {
+    if (Modes.gdl90_send_fd < 0 || !Modes.gdl90_target_valid)
+        return;
+
+    uint8_t stuffed[256];
+    int stuffed_len = gdl90Stuff(msg, msg_len, stuffed, sizeof(stuffed));
+    if (stuffed_len < 0) {
+        return;
+    }
+
+    ssize_t sent = sendto(Modes.gdl90_send_fd, stuffed, stuffed_len, 0,
+                          (struct sockaddr *)&Modes.gdl90_target_addr,
+                          sizeof(Modes.gdl90_target_addr));
+    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        static int64_t last_error = 0;
+        int64_t now = mstime();
+        if (now - last_error > 10000) {
+            fprintf(stderr, "GDL90: UDP send error: %s\n", strerror(errno));
+            last_error = now;
+        }
+    }
+}
+
+// Process incoming EFB discovery broadcasts
+static void gdl90ProcessDiscovery(void) {
+    if (Modes.gdl90_listen_fd < 0)
+        return;
+
+    char buf[512];
+    struct sockaddr_in sender_addr;
+    socklen_t sender_len = sizeof(sender_addr);
+
+    // Non-blocking receive
+    ssize_t len = recvfrom(Modes.gdl90_listen_fd, buf, sizeof(buf) - 1, MSG_DONTWAIT,
+                           (struct sockaddr *)&sender_addr, &sender_len);
+
+    if (len <= 0)
+        return;
+
+    buf[len] = '\0';
+
+    // Look for ForeFlight JSON broadcast: {"App":"ForeFlight","GDL90":{"port":4000}}
+    // Simple parsing - just look for the key fields
+    if (strstr(buf, "ForeFlight") != NULL || strstr(buf, "GDL90") != NULL) {
+        int port = GDL90_SEND_PORT;
+
+        // Try to extract port from JSON
+        char *port_str = strstr(buf, "\"port\"");
+        if (port_str) {
+            port_str = strchr(port_str, ':');
+            if (port_str) {
+                port = atoi(port_str + 1);
+                if (port <= 0 || port > 65535) port = GDL90_SEND_PORT;
+            }
+        }
+
+        // Update target address
+        memset(&Modes.gdl90_target_addr, 0, sizeof(Modes.gdl90_target_addr));
+        Modes.gdl90_target_addr.sin_family = AF_INET;
+        Modes.gdl90_target_addr.sin_addr = sender_addr.sin_addr;
+        Modes.gdl90_target_addr.sin_port = htons(port);
+
+        if (!Modes.gdl90_target_valid) {
+            fprintf(stderr, "GDL90: Discovered EFB at %s:%d\n",
+                    inet_ntoa(sender_addr.sin_addr), port);
+        }
+
+        Modes.gdl90_target_valid = 1;
+        Modes.gdl90_target_timeout = mono_milli_seconds() + GDL90_TARGET_TIMEOUT;
+    }
+}
+
+void gdl90Init(void) {
+    Modes.gdl90_listen_fd = -1;
+    Modes.gdl90_send_fd = -1;
+    Modes.gdl90_target_valid = 0;
+
+    if (!Modes.gdl90_enabled)
+        return;
+
+    // Initialize CRC table
+    gdl90CrcInit();
+
+    // Create listening socket for EFB discovery broadcasts (port 63093)
+    Modes.gdl90_listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (Modes.gdl90_listen_fd < 0) {
+        fprintf(stderr, "GDL90: Failed to create listen socket: %s\n", strerror(errno));
+        Modes.gdl90_enabled = 0;
+        return;
+    }
+
+    // Allow address reuse
+    int reuse = 1;
+    setsockopt(Modes.gdl90_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(Modes.gdl90_listen_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+
+    // Bind to discovery port
+    struct sockaddr_in listen_addr;
+    memset(&listen_addr, 0, sizeof(listen_addr));
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    listen_addr.sin_port = htons(GDL90_LISTEN_PORT);
+
+    if (bind(Modes.gdl90_listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+        fprintf(stderr, "GDL90: Failed to bind to port %d: %s\n", GDL90_LISTEN_PORT, strerror(errno));
+        close(Modes.gdl90_listen_fd);
+        Modes.gdl90_listen_fd = -1;
+        Modes.gdl90_enabled = 0;
+        return;
+    }
+
+    // Create sending socket for GDL90 data
+    Modes.gdl90_send_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (Modes.gdl90_send_fd < 0) {
+        fprintf(stderr, "GDL90: Failed to create send socket: %s\n", strerror(errno));
+        close(Modes.gdl90_listen_fd);
+        Modes.gdl90_listen_fd = -1;
+        Modes.gdl90_enabled = 0;
+        return;
+    }
+
+    Modes.gdl90_next_update = mono_milli_seconds();
+    Modes.gdl90_ahrs_next_update = mono_milli_seconds();
+    fprintf(stderr, "GDL90: Listening for EFB announcements on port %d\n", GDL90_LISTEN_PORT);
+}
+
+void gdl90Close(void) {
+    if (Modes.gdl90_listen_fd >= 0) {
+        close(Modes.gdl90_listen_fd);
+        Modes.gdl90_listen_fd = -1;
+    }
+    if (Modes.gdl90_send_fd >= 0) {
+        close(Modes.gdl90_send_fd);
+        Modes.gdl90_send_fd = -1;
+    }
+    Modes.gdl90_target_valid = 0;
+}
+
+void gdl90PeriodicWork(void) {
+    if (!Modes.gdl90_enabled)
+        return;
+
+    int64_t mono = mono_milli_seconds();
+
+    // Check for EFB discovery broadcasts
+    gdl90ProcessDiscovery();
+
+    // Check if target has timed out (use monotonic time)
+    if (Modes.gdl90_target_valid && mono > Modes.gdl90_target_timeout) {
+        fprintf(stderr, "GDL90: EFB connection timed out\n");
+        Modes.gdl90_target_valid = 0;
+    }
+
+    // Only send if we have a valid target
+    if (!Modes.gdl90_target_valid)
+        return;
+
+    int64_t now = mstime();  // Use mstime() for aircraft timestamp comparisons
+    uint8_t msg[64];
+    int msg_len;
+
+    // Find ownship aircraft (needed for both AHRS and other messages)
+    struct aircraft *ownship = NULL;
+    if (hasOwnshipConfig()) {
+        if (Modes.synthetic_now) {
+            struct craftArray *ca = &Modes.aircraftActive;
+            ca_lock_read(ca);
+            for (int i = 0; i < ca->len && !ownship; i++) {
+                struct aircraft *a = ca->list[i];
+                if (a && isOwnship(a) && now <= a->seen + 60 * SECONDS) {
+                    ownship = a;
+                }
+            }
+            ca_unlock_read(ca);
+        } else {
+            for (int j = 0; j < Modes.acBuckets && !ownship; j++) {
+                for (struct aircraft *a = Modes.aircraft[j]; a && !ownship; a = a->next) {
+                    if (isOwnship(a) && now <= a->seen + 60 * SECONDS) {
+                        ownship = a;
+                    }
+                }
+            }
+        }
+    }
+
+    // Send AHRS at 5Hz (every 200ms) - for ownship only
+    if (mono >= Modes.gdl90_ahrs_next_update) {
+        Modes.gdl90_ahrs_next_update = mono + 200;
+
+        if (ownship) {
+            msg_len = gdl90BuildAHRS(msg, sizeof(msg), ownship);
+            if (msg_len > 0) {
+                gdl90Send(msg, msg_len);
+            }
+        }
+    }
+
+    // Send other messages at 1Hz (use monotonic time for rate limiting)
+    if (mono < Modes.gdl90_next_update)
+        return;
+
+    Modes.gdl90_next_update = mono + 1000;
+
+    // Send Heartbeat
+    msg_len = gdl90BuildHeartbeat(msg, sizeof(msg));
+    if (msg_len > 0) {
+        gdl90Send(msg, msg_len);
+    }
+
+    // Send ForeFlight ID message (with ownship callsign if available)
+    msg_len = gdl90BuildForeFlightId(msg, sizeof(msg), ownship);
+    if (msg_len > 0) {
+        gdl90Send(msg, msg_len);
+    }
+
+    // Iterate through all aircraft
+    // Use aircraftActive for synthetic mode (hash buckets not populated)
+    // Use hash buckets for normal mode (lock-free, better performance)
+    if (Modes.synthetic_now) {
+        struct craftArray *ca = &Modes.aircraftActive;
+        ca_lock_read(ca);
+        for (int i = 0; i < ca->len; i++) {
+            struct aircraft *a = ca->list[i];
+            if (!a) continue;
+
+            // Skip aircraft not seen recently (within last 60 seconds)
+            if (now > a->seen + 60 * SECONDS)
+                continue;
+
+            // Skip non-ICAO addresses
+            if (a->addr & MODES_NON_ICAO_ADDRESS)
+                continue;
+
+            // Need valid position
+            if (!trackDataValid(&a->position_valid))
+                continue;
+
+            // Check if this is the ownship
+            if (isOwnship(a)) {
+                // Send Ownship Report
+                msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 1);
+                if (msg_len > 0) {
+                    gdl90Send(msg, msg_len);
+                }
+
+                // Send Ownship Geometric Altitude
+                msg_len = gdl90BuildOwnshipAlt(msg, sizeof(msg), a);
+                if (msg_len > 0) {
+                    gdl90Send(msg, msg_len);
+                }
+            } else {
+                // Send Traffic Report
+                msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
+                if (msg_len > 0) {
+                    gdl90Send(msg, msg_len);
+                }
+            }
+        }
+        ca_unlock_read(ca);
+    } else {
+        for (int j = 0; j < Modes.acBuckets; j++) {
+            for (struct aircraft *a = Modes.aircraft[j]; a; a = a->next) {
+                // Skip aircraft not seen recently (within last 60 seconds)
+                if (now > a->seen + 60 * SECONDS)
+                    continue;
+
+                // Skip non-ICAO addresses
+                if (a->addr & MODES_NON_ICAO_ADDRESS)
+                    continue;
+
+                // Need valid position
+                if (!trackDataValid(&a->position_valid))
+                    continue;
+
+                // Check if this is the ownship
+                if (isOwnship(a)) {
+                    // Send Ownship Report
+                    msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 1);
+                    if (msg_len > 0) {
+                        gdl90Send(msg, msg_len);
+                    }
+
+                    // Send Ownship Geometric Altitude
+                    msg_len = gdl90BuildOwnshipAlt(msg, sizeof(msg), a);
+                    if (msg_len > 0) {
+                        gdl90Send(msg, msg_len);
+                    }
+                } else {
+                    // Send Traffic Report
+                    msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
+                    if (msg_len > 0) {
+                        gdl90Send(msg, msg_len);
+                    }
+                }
+            }
+        }
     }
 }

@@ -971,6 +971,26 @@ struct _Modes
     struct distCoords (*rangeDirs)[RANGEDIRS_BUCKETS];
 
     int64_t apiShutdownDelay;
+
+    // EFB (Electronic Flight Bag) output configuration
+    uint32_t ownship_hex;           // Hex ID of ownship aircraft (if specified by hex)
+    char ownship_callsign[9];       // Flight ID/callsign of ownship (if specified by callsign)
+    char *efb_ip;                   // IP address to send EFB data to (for XGPS/XTRAFFIC)
+    int efb_port;                   // UDP port for XGPS/XTRAFFIC (default 49002)
+    int send_xgps;                  // Send XGPS messages for ownship
+    int send_xtraffic;              // Send XTRAFFIC messages for traffic
+    int efb_fd;                     // UDP socket for XGPS/XTRAFFIC
+    int64_t efb_next_update;        // Next time to send EFB data
+
+    // GDL90 output configuration
+    int gdl90_enabled;              // Whether GDL90 output is enabled
+    int gdl90_listen_fd;            // UDP socket for listening to EFB announcements (port 63093)
+    int gdl90_send_fd;              // UDP socket for sending GDL90 data
+    struct sockaddr_in gdl90_target_addr;  // Target address discovered from EFB announcement
+    int gdl90_target_valid;         // Whether we have a valid target address
+    int64_t gdl90_target_timeout;   // When the target address expires
+    int64_t gdl90_next_update;      // Next time to send GDL90 data (1Hz)
+    int64_t gdl90_ahrs_next_update; // Next time to send AHRS data (5Hz)
 };
 
 extern struct _Modes Modes;
@@ -1375,6 +1395,12 @@ enum {
     OptSoapyBandwith,
     OptSoapyEnableAgc,
     OptSoapyGainElement,
+    OptFilterHexId,
+    OptOwnship,
+    OptEfbIp,
+    OptSendXgps,
+    OptSendXtraffic,
+    OptGdl90,
 };
 
 
@@ -1405,6 +1431,7 @@ extern "C"
     void interactiveInit (void);
     void interactiveShowData (void);
     void interactiveCleanup (void);
+    void interactiveSendOwnship (void);
 
     // Provided by readsb.c & viewadsb.c
     void receiverPositionChanged (float lat, float lon, float alt);

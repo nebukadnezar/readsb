@@ -987,6 +987,8 @@ static void *decodeEntryPoint(void *arg) {
     pthread_mutex_lock(&Threads.decode.mutex);
 
     modesInitNet();
+    efbInit();
+    gdl90Init();
 
     /* If the user specifies --net-only, just run in order to serve network
      * clients without reading data from the RTL device.
@@ -1369,6 +1371,12 @@ static void backgroundTasks(int64_t now) {
         modesNetPeriodicWork();
     }
 
+    // EFB XGPS/XTRAFFIC UDP output
+    efbPeriodicWork();
+
+    // GDL90 UDP output
+    gdl90PeriodicWork();
+
     // Refresh screen when in interactive mode
     static int64_t next_interactive;
     if (Modes.interactive && now > next_interactive) {
@@ -1670,6 +1678,79 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     int maxTokens = 128;
     char* token[maxTokens];
     switch (key) {
+        case OptOwnship:
+            {
+                // Check if arg looks like a hex ID (1-6 hex characters)
+                // or a callsign (contains non-hex characters or > 6 chars)
+                int is_hex = 1;
+                int len = strlen(arg);
+
+                // If > 6 chars, definitely a callsign
+                if (len > 6) {
+                    is_hex = 0;
+                } else {
+                    // Check if all characters are valid hex digits
+                    for (int i = 0; i < len && is_hex; i++) {
+                        char c = arg[i];
+                        if (!((c >= '0' && c <= '9') ||
+                              (c >= 'a' && c <= 'f') ||
+                              (c >= 'A' && c <= 'F'))) {
+                            is_hex = 0;
+                        }
+                    }
+                }
+
+                if (is_hex && len > 0 && len <= 6) {
+                    Modes.ownship_hex = (uint32_t)strtol(arg, NULL, 16);
+                    Modes.ownship_callsign[0] = '\0';
+                    fprintf(stderr, "Ownship hex ID: %06x\n", Modes.ownship_hex);
+                } else {
+                    // It's a callsign
+                    Modes.ownship_hex = 0;
+                    strncpy(Modes.ownship_callsign, arg, 8);
+                    Modes.ownship_callsign[8] = '\0';
+                    // Convert to uppercase for matching
+                    for (int i = 0; Modes.ownship_callsign[i]; i++) {
+                        if (Modes.ownship_callsign[i] >= 'a' && Modes.ownship_callsign[i] <= 'z') {
+                            Modes.ownship_callsign[i] -= 32;
+                        }
+                    }
+                    fprintf(stderr, "Ownship callsign: %s\n", Modes.ownship_callsign);
+                }
+            }
+            break;
+        case OptEfbIp:
+            {
+                // Parse ip[:port] format
+                char *colon = strchr(arg, ':');
+                if (colon) {
+                    *colon = '\0';
+                    Modes.efb_ip = strdup(arg);
+                    Modes.efb_port = atoi(colon + 1);
+                    *colon = ':'; // restore the string
+                } else {
+                    Modes.efb_ip = strdup(arg);
+                    Modes.efb_port = 49002; // Default EFB port for XGPS/XTRAFFIC
+                }
+                Modes.net = 1; // EFB output requires networking
+                fprintf(stderr, "EFB IP set to %s:%d\n", Modes.efb_ip, Modes.efb_port);
+            }
+            break;
+        case OptSendXgps:
+            Modes.send_xgps = 1;
+            Modes.net = 1;
+            fprintf(stderr, "XGPS output enabled\n");
+            break;
+        case OptSendXtraffic:
+            Modes.send_xtraffic = 1;
+            Modes.net = 1;
+            fprintf(stderr, "XTRAFFIC output enabled\n");
+            break;
+        case OptGdl90:
+            Modes.gdl90_enabled = 1;
+            Modes.net = 1;
+            fprintf(stderr, "GDL90 output enabled (listening for EFB announcements)\n");
+            break;
         case OptDevice:
             Modes.dev_name = strdup(arg);
             break;
@@ -3336,6 +3417,10 @@ int main(int argc, char **argv) {
         // force stats to be done, this must happen before network cleanup as it checks network stuff
         Modes.next_stats_update = 0;
         priorityTasksRun();
+
+        /* Cleanup EFB and GDL90 UDP output */
+        efbClose();
+        gdl90Close();
 
         /* Cleanup network setup */
         cleanupNetwork();

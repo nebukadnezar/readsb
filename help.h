@@ -172,6 +172,12 @@ static struct argp_option optionsReadsb[] = {
     {"net-buffer", OptNetBuffer, "<n>", 0, "control some buffer sizes: 8KB * (2^n) (default: n=1, 16KB)", 2},
     {"net-verbatim", OptNetVerbatim, 0, 0, "Forward messages unchanged", 2},
     {"sdr-buffer-size", OptSdrBufSize, "<KiB>", 0, "SDR buffer / USB transfer size in kibibytes (default: 128 which is equivalent to around 28 ms using rtl-sdr, option might be ignored in future versions)", 2},
+    {"filter-hex", OptFilterHexId, "HEXID", 0, "Only process messages from the specified hex ID aircraft", 2},
+    {"ownship", OptOwnship, "<hex|callsign>", 0, "Ownship aircraft identifier: ICAO hex ID or flight ID/callsign (used by --sendxgps and GDL90)", 2},
+    {"efb-ip", OptEfbIp, "<ip[:port]>", 0, "IP address to send XGPS/XTRAFFIC data to (default port: 49002)", 2},
+    {"sendxgps", OptSendXgps, 0, 0, "Send XGPS messages for ownship to --efb-ip (requires --ownship)", 2},
+    {"sendxtraffic", OptSendXtraffic, 0, 0, "Send XTRAFFIC messages for traffic to --efb-ip", 2},
+    {"gdl90", OptGdl90, 0, 0, "Enable GDL90 protocol output. Listens for EFB announcements and sends via UDP unicast.", 2},
 #ifdef ENABLE_RTLSDR
     {0,0,0,0, "RTL-SDR options:", 3},
     {0,0,0, OPTION_DOC, "use with --device-type rtlsdr", 3},

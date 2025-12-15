@@ -206,6 +206,7 @@ void serviceListen (struct net_service *service, char *bind_addr, char *bind_por
 void serviceClose(struct net_service *s);
 
 void sendBeastSettings (int fd, const char *settings);
+void sendOwnshipCommand(int fd, char type, const char *value);
 void sendData(struct net_writer *output, char *data, int len);
 
 void modesInitNet (void);
@@ -237,5 +238,15 @@ typedef union __packed {
 void netUseMessage(struct modesMessage *mm);
 void netDrainMessageBuffers();
 struct modesMessage *netGetMM(struct messageBuffer *buf);
+
+// EFB (Electronic Flight Bag) output functions - XGPS/XTRAFFIC protocol
+void efbInit(void);
+void efbClose(void);
+void efbPeriodicWork(void);
+
+// GDL90 protocol output functions
+void gdl90Init(void);
+void gdl90Close(void);
+void gdl90PeriodicWork(void);
 
 #endif
