@@ -1865,6 +1865,17 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.lonString = strdup(arg);
             Modes.fUserLon = atof(arg);
             break;
+        case OptAlt:
+            // Parse altitude - can be in meters or feet (with 'ft' suffix)
+            {
+                double alt = atof(arg);
+                // Check for 'ft' suffix
+                if (strstr(arg, "ft") || strstr(arg, "FT")) {
+                    alt = alt * 0.3048;  // Convert feet to meters
+                }
+                Modes.fUserAlt = alt;
+            }
+            break;
         case OptMaxRange:
             Modes.maxRange = atof(arg) * 1852.0; // convert to metres
             break;

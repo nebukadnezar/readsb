@@ -52,6 +52,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "readsb.h"
+#include <strings.h>
 
 #ifndef DISABLE_INTERACTIVE
 #include <curses.h>
@@ -86,6 +87,10 @@ static int convert_speed(int kts) {
     else
         return kts;
 }
+
+// External declarations for distance and bearing calculations
+extern double greatcircle(double lat0, double lon0, double lat1, double lon1, int approx);
+extern double bearing(double lat0, double lon0, double lat1, double lon1);
 
 //
 //=========================================================================
@@ -122,6 +127,61 @@ static int isOwnship(struct aircraft *a) {
         }
     }
     return 0;
+}
+
+// Get reference position for distance calculations
+// Returns 1 if position is valid, 0 otherwise
+// If ownship is set and has valid position, use ownship
+// Otherwise use receiver position
+static int getRefPosition(double *lat, double *lon, double *alt_m) {
+    // In viewadsb mode, check if ownship is set and has valid position
+    if (Modes.viewadsb && (viewadsb_ownship_hex != 0 || viewadsb_ownship_callsign[0] != '\0')) {
+        struct craftArray *ca = &Modes.aircraftActive;
+        for (int i = 0; i < ca->len; i++) {
+            struct aircraft *a = ca->list[i];
+            if (a && isOwnship(a)) {
+                if (trackDataValid(&a->position_valid)) {
+                    *lat = a->lat;
+                    *lon = a->lon;
+                    // Get altitude in meters - prefer barometric altitude
+                    if (trackDataValid(&a->baro_alt_valid)) {
+                        *alt_m = a->baro_alt * 0.3048;  // feet to meters
+                    } else if (trackDataValid(&a->geom_alt_valid)) {
+                        *alt_m = a->geom_alt * 0.3048;  // feet to meters
+                    } else {
+                        *alt_m = 0;
+                    }
+                    return 1;
+                }
+                break;
+            }
+        }
+    }
+    
+    // Fall back to receiver position
+    if (Modes.fUserLat != 0 || Modes.fUserLon != 0) {
+        *lat = Modes.fUserLat;
+        *lon = Modes.fUserLon;
+        // fUserAlt == -2e6 means not set, treat as 0
+        *alt_m = (Modes.fUserAlt > -1e6) ? Modes.fUserAlt : 0;
+        return 1;
+    }
+    
+    return 0;
+}
+
+// Calculate 3D distance including altitude difference
+// Returns distance in meters
+static double calculate3DDistance(double ref_lat, double ref_lon, double ref_alt_m,
+                                   double tgt_lat, double tgt_lon, double tgt_alt_m) {
+    // Get 2D great circle distance
+    double horiz_dist = greatcircle(ref_lat, ref_lon, tgt_lat, tgt_lon, 0);
+    
+    // Calculate vertical distance
+    double vert_dist = tgt_alt_m - ref_alt_m;
+    
+    // 3D distance using Pythagoras
+    return sqrt(horiz_dist * horiz_dist + vert_dist * vert_dist);
 }
 
 // Set ownship from input string (hex or callsign)
@@ -268,6 +328,8 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
     char strWD[5] = " ";
     char strNIC[4] = " ";
     char strNACp[5] = " ";
+    char strDist[7] = " ";
+    char strBrg[4] = " ";
 
     if (trackDataValid(&a->squawk_valid)) {
         snprintf(strSquawk, 5, "%04x", a->squawk);
@@ -363,6 +425,33 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
     if (trackDataValid(&a->position_valid)) {
         snprintf(strLat, 8, "%7.03f", a->lat);
         snprintf(strLon, 9, "%8.03f", a->lon);
+        
+        // Calculate distance and bearing from reference position
+        double ref_lat, ref_lon, ref_alt_m;
+        if (getRefPosition(&ref_lat, &ref_lon, &ref_alt_m)) {
+            // Get target altitude in meters - prefer barometric altitude
+            double tgt_alt_m = 0;
+            if (trackDataValid(&a->baro_alt_valid)) {
+                tgt_alt_m = a->baro_alt * 0.3048;
+            } else if (trackDataValid(&a->geom_alt_valid)) {
+                tgt_alt_m = a->geom_alt * 0.3048;
+            }
+            
+            // Calculate 3D distance
+            double dist_m = calculate3DDistance(ref_lat, ref_lon, ref_alt_m,
+                                                 a->lat, a->lon, tgt_alt_m);
+            double dist_display = convert_distance((int)dist_m);
+            
+            if (dist_display < 100) {
+                snprintf(strDist, 7, "%5.1f", dist_display);
+            } else {
+                snprintf(strDist, 7, "%5.0f", dist_display);
+            }
+            
+            // Calculate bearing
+            double brg = bearing(ref_lat, ref_lon, a->lat, a->lon);
+            snprintf(strBrg, 4, "%03.0f", brg);
+        }
     }
 
     if (trackDataValid(&a->airground_valid) && a->airground == AG_GROUND) {
@@ -450,10 +539,10 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
     printw("%3s  %3s  %3s  %3s", strOAT, strTAT, strWD, strWS);
     if (has_colors()) attroff(COLOR_PAIR(2));
 
-    // White: Ttk, MHd, TkR, Roll, Lat, Long, NIC, NACp, RSSI, Msgs, Ti
-    printw("  %3s  %3s  %4s %5s %7s %8s %3s %4s %5.1f %5d %2.0f",
+    // White: Ttk, MHd, TkR, Roll, Lat, Long, Dist, Brg, NIC, NACp, RSSI, Msgs, Ti
+    printw("  %3s  %3s  %4s %5s %7s %8s %5s %3s %3s %4s %5.1f %5d %2.0f",
            strTt, strMagHdg, strTrackRate, strRoll,
-           strLat, strLon, strNIC, strNACp, 10 * log10(signalAverage), msgs, (now - a->seen) / 1000.0);
+           strLat, strLon, strDist, strBrg, strNIC, strNACp, 10 * log10(signalAverage), msgs, (now - a->seen) / 1000.0);
 
     return 1;
 }
@@ -479,41 +568,35 @@ static int compareDist(const void *p1, const void *p2) {
     if (valid1 != valid2) {
         return valid2 - valid1;
     }
-    return a1->receiver_distance - a2->receiver_distance;
-}
-static int compareAlt(const void *p1, const void *p2) {
-    struct aircraft *a1 = *(struct aircraft**) p1;
-    struct aircraft *a2 = *(struct aircraft**) p2;
-    if (a1 == NULL)
-        return 1;
-    if (a2 == NULL)
-        return -1;
-    int valid1 = trackDataValid(&a1->baro_alt_valid);
-    int valid2 = trackDataValid(&a2->baro_alt_valid);
-
-    int g1 = trackDataValid(&a1->airground_valid) && a1->airground == AG_GROUND;
-    int g2 = trackDataValid(&a2->airground_valid) && a2->airground == AG_GROUND;
-
-    if (g1 || g2) {
-        if (g1 && g2) {
+    
+    // Calculate 3D distance for comparison
+    double ref_lat, ref_lon, ref_alt_m;
+    if (!getRefPosition(&ref_lat, &ref_lon, &ref_alt_m)) {
+        // No reference position, use 2D receiver_distance
+        if (a1->receiver_distance == a2->receiver_distance)
             return a1->addr - a2->addr;
-        }
-        return g2 - g1;
+        return (a1->receiver_distance > a2->receiver_distance) ? 1 : -1;
     }
-
-    if (!valid1 && !valid2) {
+    
+    // Get altitudes in meters - prefer barometric altitude
+    double alt1_m = 0, alt2_m = 0;
+    if (trackDataValid(&a1->baro_alt_valid)) {
+        alt1_m = a1->baro_alt * 0.3048;
+    } else if (trackDataValid(&a1->geom_alt_valid)) {
+        alt1_m = a1->geom_alt * 0.3048;
+    }
+    if (trackDataValid(&a2->baro_alt_valid)) {
+        alt2_m = a2->baro_alt * 0.3048;
+    } else if (trackDataValid(&a2->geom_alt_valid)) {
+        alt2_m = a2->geom_alt * 0.3048;
+    }
+    
+    double dist1 = calculate3DDistance(ref_lat, ref_lon, ref_alt_m, a1->lat, a1->lon, alt1_m);
+    double dist2 = calculate3DDistance(ref_lat, ref_lon, ref_alt_m, a2->lat, a2->lon, alt2_m);
+    
+    if (dist1 == dist2)
         return a1->addr - a2->addr;
-    }
-
-    if (valid1 != valid2) {
-        return valid2 - valid1;
-    }
-
-    if (a1->baro_alt == a2->baro_alt) {
-        return a1->addr - a2->addr;
-    }
-
-    return a1->baro_alt - a2->baro_alt;
+    return (dist1 > dist2) ? 1 : -1;
 }
 
 void interactiveShowData(void) {
@@ -538,8 +621,35 @@ void interactiveShowData(void) {
     if (now > next_clear) {
         next_clear = now + 2 * SECONDS;
         clear();
+        
+        // Print receiver info line (viewadsb only)
+        if (Modes.viewadsb) {
+            move(0, 0);
+            double ref_lat, ref_lon, ref_alt_m;
+            if (getRefPosition(&ref_lat, &ref_lon, &ref_alt_m)) {
+                const char *pos_source = (viewadsb_ownship_hex != 0 || viewadsb_ownship_callsign[0] != '\0') ? "Ownship" : "Receiver";
+                if (has_colors()) attron(COLOR_PAIR(3));
+                printw("%s: %.4f, %.4f", pos_source, ref_lat, ref_lon);
+                if (ref_alt_m != 0) {
+                    if (Modes.metric) {
+                        printw(", %.0fm", ref_alt_m);
+                    } else {
+                        printw(", %.0fft", ref_alt_m / 0.3048);
+                    }
+                }
+                if (has_colors()) attroff(COLOR_PAIR(3));
+                // Show gain if available (readsb only, viewadsb doesn't have gain info)
+                if (!Modes.viewadsb && Modes.gain != MODES_AUTO_GAIN && Modes.gain != MODES_MAX_GAIN && Modes.gain != 0) {
+                    printw("  Gain: %.1fdB", Modes.gain / 10.0);
+                }
+            } else {
+                printw("No receiver position set (use --lat/--lon or set ownship)");
+            }
+        }
+        
         // print header with colors matching data columns
-        move(0, 0);
+        int header_row = Modes.viewadsb ? 1 : 0;
+        move(header_row, 0);
         printw(" Hex    M  Sqwk  Flight   Ct ");
         if (has_colors()) attron(COLOR_PAIR(1));
         printw("APMode        QNH SelAl SelHd");
@@ -548,29 +658,23 @@ void interactiveShowData(void) {
         if (has_colors()) attron(COLOR_PAIR(2));
         printw("OAT  TAT  WD   WS");
         if (has_colors()) attroff(COLOR_PAIR(2));
-        printw("  Ttk  MHd  TkR  Roll   Lat      Long   NIC NACp  RSSI  Msgs  Ti");
-        mvhline(1, 0, ACS_HLINE, 193);
+        printw("  Ttk  MHd  TkR  Roll   Lat      Long   Dist Brg NIC NACp  RSSI  Msgs  Ti");
+        mvhline(header_row + 1, 0, ACS_HLINE, 205);
     }
 
 
     progress = spinner[(now / 1000) % 4];
-    mvaddch(0, 193, progress);
+    int header_row = Modes.viewadsb ? 1 : 0;
+    mvaddch(header_row, 205, progress);
 
     int rows = getmaxy(stdscr);
-    int row = 2;
+    int row = Modes.viewadsb ? 3 : 2;
 
     struct craftArray *ca = &Modes.aircraftActive;
 
-    // sort active list by altitude
-    /*
-    pthread_mutex_lock(&ca->change_mutex);
-    pthread_mutex_lock(&ca->write_mutex);
-    qsort(ca->list, ca->len, sizeof(struct aircraft *), compareAlt);
-    pthread_mutex_unlock(&ca->write_mutex);
-    pthread_mutex_unlock(&ca->change_mutex);
-    */
-
+    // sort active list by distance (use read lock - display only operation)
     ca_lock_read(ca);
+    qsort(ca->list, ca->len, sizeof(struct aircraft *), compareDist);
 
     // Find and print ownship first (viewadsb mode only)
     struct aircraft *ownship_printed = NULL;

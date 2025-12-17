@@ -4626,8 +4626,6 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
     signalLevel = signalLevel * signalLevel;
     p++;
 
-    int processedBytes = 0;
-
     for (int j = 0; j < bytes; j++) {
         if (p >= c->eod) {
             // incomplete message
@@ -4647,7 +4645,6 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
         printHexDigit(out, *p);
         out += 2;
         p++;
-        processedBytes++;
     }
 
     out = safe_snprintf(out, end, ";");
@@ -6654,8 +6651,17 @@ static void efbSendAircraft(struct aircraft *a, double feet_per_meter, double kn
         airborne = (a->airground == AG_AIRBORNE) ? 1 : 0;
     }
 
-    // Get callsign
-    const char *callsign = a->callsign[0] ? a->callsign : "";
+    // Get callsign (strip trailing spaces for text protocols)
+    char callsign[9];
+    memset(callsign, 0, sizeof(callsign));
+    if (a->callsign[0]) {
+        strncpy(callsign, a->callsign, 8);
+        callsign[8] = '\0';
+        // Trim trailing spaces
+        for (int i = 7; i >= 0 && callsign[i] == ' '; i--) {
+            callsign[i] = '\0';
+        }
+    }
 
     // Check if this is the ownship
     if (isOwnship(a)) {
@@ -7086,9 +7092,14 @@ static int gdl90BuildTrafficReport(uint8_t *msg, int size, struct aircraft *a, i
     msg[18] = gdl90ConvertCategory(a->category);
 
     // Call Sign (8 bytes, space-padded ASCII)
+    // Strip trailing spaces from source, then space-pad to 8 bytes per GDL90 spec
     memset(&msg[19], ' ', 8);
     if (a->callsign[0]) {
         int cs_len = strlen(a->callsign);
+        // Trim trailing spaces
+        while (cs_len > 0 && a->callsign[cs_len - 1] == ' ') {
+            cs_len--;
+        }
         if (cs_len > 8) cs_len = 8;
         memcpy(&msg[19], a->callsign, cs_len);
     }
@@ -7169,13 +7180,15 @@ static int gdl90BuildForeFlightId(uint8_t *msg, int size, struct aircraft *ownsh
     // Device name (8 bytes) - use ownship callsign if available
     memset(&msg[11], ' ', 8);
     if (ownship && ownship->callsign[0]) {
-        // Copy callsign, padding with spaces
+        // Copy callsign, stripping trailing spaces then padding with spaces
         int len = strlen(ownship->callsign);
+        while (len > 0 && ownship->callsign[len - 1] == ' ') len--;
         if (len > 8) len = 8;
         memcpy(&msg[11], ownship->callsign, len);
     } else if (Modes.ownship_callsign[0]) {
         // Use configured callsign
         int len = strlen(Modes.ownship_callsign);
+        while (len > 0 && Modes.ownship_callsign[len - 1] == ' ') len--;
         if (len > 8) len = 8;
         memcpy(&msg[11], Modes.ownship_callsign, len);
     } else {
@@ -7185,12 +7198,22 @@ static int gdl90BuildForeFlightId(uint8_t *msg, int size, struct aircraft *ownsh
     // Device long name (16 bytes) - use ownship callsign + suffix if available
     memset(&msg[19], ' ', 16);
     if (ownship && ownship->callsign[0]) {
+        // Strip trailing spaces from callsign for long name
+        char cs[9];
+        strncpy(cs, ownship->callsign, 8);
+        cs[8] = '\0';
+        for (int i = 7; i >= 0 && cs[i] == ' '; i--) cs[i] = '\0';
         char longname[17];
-        snprintf(longname, sizeof(longname), "%-8s ADS-B", ownship->callsign);
+        snprintf(longname, sizeof(longname), "%-8s ADS-B", cs);
         memcpy(&msg[19], longname, 16);
     } else if (Modes.ownship_callsign[0]) {
+        // Strip trailing spaces from configured callsign
+        char cs[9];
+        strncpy(cs, Modes.ownship_callsign, 8);
+        cs[8] = '\0';
+        for (int i = 7; i >= 0 && cs[i] == ' '; i--) cs[i] = '\0';
         char longname[17];
-        snprintf(longname, sizeof(longname), "%-8s ADS-B", Modes.ownship_callsign);
+        snprintf(longname, sizeof(longname), "%-8s ADS-B", cs);
         memcpy(&msg[19], longname, 16);
     } else {
         memcpy(&msg[19], "readsb ADS-B", 12);

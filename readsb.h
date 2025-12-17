@@ -1273,6 +1273,7 @@ enum {
     OptForwardMlatSbs,
     OptLat,
     OptLon,
+    OptAlt,
     OptMaxRange,
     OptFix,
     OptNoFix,
