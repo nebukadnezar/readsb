@@ -107,6 +107,30 @@ static int ownship_input_active = 0; // 1 if currently entering ownship
 static uint32_t viewadsb_ownship_hex = 0;
 static char viewadsb_ownship_callsign[9] = "";
 
+// Sort mode for viewadsb
+typedef enum {
+    SORT_DISTANCE = 0,
+    SORT_ALTITUDE,
+    SORT_CALLSIGN,
+    SORT_CATEGORY,
+    SORT_SPEED,
+    SORT_RSSI,
+    SORT_COUNT
+} sort_mode_t;
+
+static sort_mode_t current_sort_mode = SORT_DISTANCE;
+static int sort_ascending = 1;  // 1 = ascending, 0 = descending
+static int sort_input_active = 0;  // 1 if selecting sort mode
+
+static const char *sort_mode_names[] = {
+    "Distance",
+    "Altitude",
+    "Callsign",
+    "Category",
+    "Speed",
+    "RSSI"
+};
+
 // Check if aircraft matches the local viewadsb ownship
 static int isOwnship(struct aircraft *a) {
     // Check by hex ID (mask off non-ICAO address flag)
@@ -599,6 +623,125 @@ static int compareDist(const void *p1, const void *p2) {
     return (dist1 > dist2) ? 1 : -1;
 }
 
+// Compare by altitude (barometric preferred)
+static int compareAlt(const void *p1, const void *p2) {
+    struct aircraft *a1 = *(struct aircraft**) p1;
+    struct aircraft *a2 = *(struct aircraft**) p2;
+    if (a1 == NULL) return 1;
+    if (a2 == NULL) return -1;
+
+    int valid1 = trackDataValid(&a1->baro_alt_valid) || trackDataValid(&a1->geom_alt_valid);
+    int valid2 = trackDataValid(&a2->baro_alt_valid) || trackDataValid(&a2->geom_alt_valid);
+    
+    // Aircraft on ground go to the end
+    int g1 = trackDataValid(&a1->airground_valid) && a1->airground == AG_GROUND;
+    int g2 = trackDataValid(&a2->airground_valid) && a2->airground == AG_GROUND;
+    if (g1 && !g2) return sort_ascending ? 1 : -1;
+    if (!g1 && g2) return sort_ascending ? -1 : 1;
+    if (g1 && g2) return a1->addr - a2->addr;
+
+    if (!valid1 && !valid2) return a1->addr - a2->addr;
+    if (!valid1) return 1;
+    if (!valid2) return -1;
+
+    int alt1 = trackDataValid(&a1->baro_alt_valid) ? a1->baro_alt : a1->geom_alt;
+    int alt2 = trackDataValid(&a2->baro_alt_valid) ? a2->baro_alt : a2->geom_alt;
+
+    if (alt1 == alt2) return a1->addr - a2->addr;
+    int result = (alt1 > alt2) ? 1 : -1;
+    return sort_ascending ? result : -result;
+}
+
+// Compare by callsign
+static int compareCallsign(const void *p1, const void *p2) {
+    struct aircraft *a1 = *(struct aircraft**) p1;
+    struct aircraft *a2 = *(struct aircraft**) p2;
+    if (a1 == NULL) return 1;
+    if (a2 == NULL) return -1;
+
+    int has1 = a1->callsign[0] != '\0';
+    int has2 = a2->callsign[0] != '\0';
+    
+    if (!has1 && !has2) return a1->addr - a2->addr;
+    if (!has1) return 1;
+    if (!has2) return -1;
+
+    int result = strcmp(a1->callsign, a2->callsign);
+    if (result == 0) return a1->addr - a2->addr;
+    return sort_ascending ? result : -result;
+}
+
+// Compare by category
+static int compareCategory(const void *p1, const void *p2) {
+    struct aircraft *a1 = *(struct aircraft**) p1;
+    struct aircraft *a2 = *(struct aircraft**) p2;
+    if (a1 == NULL) return 1;
+    if (a2 == NULL) return -1;
+
+    if (a1->category == 0 && a2->category == 0) return a1->addr - a2->addr;
+    if (a1->category == 0) return 1;
+    if (a2->category == 0) return -1;
+
+    if (a1->category == a2->category) return a1->addr - a2->addr;
+    int result = (a1->category > a2->category) ? 1 : -1;
+    return sort_ascending ? result : -result;
+}
+
+// Compare by ground speed
+static int compareSpeed(const void *p1, const void *p2) {
+    struct aircraft *a1 = *(struct aircraft**) p1;
+    struct aircraft *a2 = *(struct aircraft**) p2;
+    if (a1 == NULL) return 1;
+    if (a2 == NULL) return -1;
+
+    int valid1 = trackDataValid(&a1->gs_valid);
+    int valid2 = trackDataValid(&a2->gs_valid);
+    
+    if (!valid1 && !valid2) return a1->addr - a2->addr;
+    if (!valid1) return 1;
+    if (!valid2) return -1;
+
+    if (a1->gs == a2->gs) return a1->addr - a2->addr;
+    int result = (a1->gs > a2->gs) ? 1 : -1;
+    return sort_ascending ? result : -result;
+}
+
+// Compare by RSSI
+static int compareRssi(const void *p1, const void *p2) {
+    struct aircraft *a1 = *(struct aircraft**) p1;
+    struct aircraft *a2 = *(struct aircraft**) p2;
+    if (a1 == NULL) return 1;
+    if (a2 == NULL) return -1;
+
+    double rssi1 = (a1->signalLevel[0] + a1->signalLevel[1] + a1->signalLevel[2] + a1->signalLevel[3] +
+                    a1->signalLevel[4] + a1->signalLevel[5] + a1->signalLevel[6] + a1->signalLevel[7]) / 8.0;
+    double rssi2 = (a2->signalLevel[0] + a2->signalLevel[1] + a2->signalLevel[2] + a2->signalLevel[3] +
+                    a2->signalLevel[4] + a2->signalLevel[5] + a2->signalLevel[6] + a2->signalLevel[7]) / 8.0;
+
+    if (rssi1 == rssi2) return a1->addr - a2->addr;
+    int result = (rssi1 > rssi2) ? 1 : -1;
+    return sort_ascending ? result : -result;
+}
+
+// Wrapper for compareDist that respects sort direction
+static int compareDistSorted(const void *p1, const void *p2) {
+    int result = compareDist(p1, p2);
+    return sort_ascending ? result : -result;
+}
+
+// Get the appropriate compare function for current sort mode
+static int (*getCompareFunction(void))(const void *, const void *) {
+    switch (current_sort_mode) {
+        case SORT_ALTITUDE:  return compareAlt;
+        case SORT_CALLSIGN:  return compareCallsign;
+        case SORT_CATEGORY:  return compareCategory;
+        case SORT_SPEED:     return compareSpeed;
+        case SORT_RSSI:      return compareRssi;
+        case SORT_DISTANCE:
+        default:             return compareDistSorted;
+    }
+}
+
 void interactiveShowData(void) {
     static int64_t next_update;
     static int64_t next_clear;
@@ -687,9 +830,9 @@ void interactiveShowData(void) {
 
     struct craftArray *ca = &Modes.aircraftActive;
 
-    // sort active list by distance (use read lock - display only operation)
+    // sort active list (use read lock - display only operation)
     ca_lock_read(ca);
-    qsort(ca->list, ca->len, sizeof(struct aircraft *), compareDist);
+    qsort(ca->list, ca->len, sizeof(struct aircraft *), getCompareFunction());
 
     // Find and print ownship first (viewadsb mode only)
     struct aircraft *ownship_printed = NULL;
@@ -754,37 +897,85 @@ void interactiveShowData(void) {
         }
     }
 
-    // Handle keyboard input for ownship (viewadsb only)
+    // Handle keyboard input (viewadsb only)
     if (Modes.viewadsb) {
         int ch;
         while ((ch = getch()) != ERR) {
-            if (ch == 27) {  // ESC key - cancel input
-                ownship_input_len = 0;
-                ownship_input[0] = '\0';
-                ownship_input_active = 0;
-            } else if (ch == '\n' || ch == '\r') {  // Enter - submit
-                if (ownship_input_len > 0) {
-                    ownship_input[ownship_input_len] = '\0';
-                    setOwnshipFromInput(ownship_input);
-                } else {
-                    // Empty input clears ownship
-                    setOwnshipFromInput(NULL);
+            if (sort_input_active) {
+                // Sort selection mode
+                if (ch == 27 || ch == 's' || ch == 'S') {  // ESC or 's' to exit sort mode
+                    sort_input_active = 0;
+                } else if (ch >= '1' && ch <= '6') {
+                    sort_mode_t new_mode = (sort_mode_t)(ch - '1');
+                    if (new_mode == current_sort_mode) {
+                        // Same mode - toggle direction
+                        sort_ascending = !sort_ascending;
+                    } else {
+                        // New mode - reset to ascending
+                        current_sort_mode = new_mode;
+                        sort_ascending = 1;
+                    }
+                    sort_input_active = 0;
+                } else if (ch == 'd' || ch == 'D') {
+                    current_sort_mode = SORT_DISTANCE;
+                    sort_input_active = 0;
+                } else if (ch == 'a' || ch == 'A') {
+                    current_sort_mode = SORT_ALTITUDE;
+                    sort_input_active = 0;
+                } else if (ch == 'c' || ch == 'C') {
+                    current_sort_mode = SORT_CALLSIGN;
+                    sort_input_active = 0;
+                } else if (ch == 't' || ch == 'T') {  // 't' for type/category
+                    current_sort_mode = SORT_CATEGORY;
+                    sort_input_active = 0;
+                } else if (ch == 'g' || ch == 'G') {  // 'g' for ground speed
+                    current_sort_mode = SORT_SPEED;
+                    sort_input_active = 0;
+                } else if (ch == 'r' || ch == 'R') {
+                    current_sort_mode = SORT_RSSI;
+                    sort_input_active = 0;
                 }
-                ownship_input_len = 0;
-                ownship_input[0] = '\0';
-                ownship_input_active = 0;
-            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
-                if (ownship_input_len > 0) {
-                    ownship_input_len--;
-                    ownship_input[ownship_input_len] = '\0';
-                }
-                if (ownship_input_len == 0) {
+            } else if (ownship_input_active) {
+                // Ownship input mode
+                if (ch == 27) {  // ESC key - cancel input
+                    ownship_input_len = 0;
+                    ownship_input[0] = '\0';
                     ownship_input_active = 0;
+                } else if (ch == '\n' || ch == '\r') {  // Enter - submit
+                    if (ownship_input_len > 0) {
+                        ownship_input[ownship_input_len] = '\0';
+                        setOwnshipFromInput(ownship_input);
+                    } else {
+                        // Empty input clears ownship
+                        setOwnshipFromInput(NULL);
+                    }
+                    ownship_input_len = 0;
+                    ownship_input[0] = '\0';
+                    ownship_input_active = 0;
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
+                    if (ownship_input_len > 0) {
+                        ownship_input_len--;
+                        ownship_input[ownship_input_len] = '\0';
+                    }
+                    if (ownship_input_len == 0) {
+                        ownship_input_active = 0;
+                    }
+                } else if (ch >= 32 && ch < 127 && ownship_input_len < 15) {  // Printable char
+                    ownship_input[ownship_input_len++] = (char)ch;
+                    ownship_input[ownship_input_len] = '\0';
                 }
-            } else if (ch >= 32 && ch < 127 && ownship_input_len < 15) {  // Printable char
-                ownship_input[ownship_input_len++] = (char)ch;
-                ownship_input[ownship_input_len] = '\0';
-                ownship_input_active = 1;
+            } else {
+                // Normal mode - check for command keys
+                if (ch == 'o' || ch == 'O') {
+                    ownship_input_active = 1;
+                    ownship_input_len = 0;
+                    ownship_input[0] = '\0';
+                } else if (ch == 's' || ch == 'S') {
+                    sort_input_active = 1;
+                } else if (ch == 'q' || ch == 'Q') {
+                    // Quick toggle sort direction
+                    sort_ascending = !sort_ascending;
+                }
             }
         }
     }
@@ -792,32 +983,40 @@ void interactiveShowData(void) {
     move(row, 0);
     clrtobot();
 
-    // Display ownship status/input at bottom of screen (viewadsb only)
+    // Display status/input at bottom of screen (viewadsb only)
     if (Modes.viewadsb) {
         int bottom_row = getmaxy(stdscr) - 1;
         move(bottom_row, 0);
         clrtoeol();
 
-        if (ownship_input_active) {
-            // Show input prompt
+        if (sort_input_active) {
+            // Show sort selection menu
+            printw("Sort: ");
+            for (int i = 0; i < SORT_COUNT; i++) {
+                if (i == (int)current_sort_mode) {
+                    if (has_colors()) attron(COLOR_PAIR(3) | A_BOLD);
+                    printw("[%d:%s%s] ", i + 1, sort_mode_names[i], sort_ascending ? "+" : "-");
+                    if (has_colors()) attroff(COLOR_PAIR(3) | A_BOLD);
+                } else {
+                    printw("%d:%s ", i + 1, sort_mode_names[i]);
+                }
+            }
+            printw(" (ESC=cancel)");
+        } else if (ownship_input_active) {
+            // Show ownship input prompt
             if (has_colors()) attron(COLOR_PAIR(3));
             printw("Ownship: %s_", ownship_input);
             if (has_colors()) attroff(COLOR_PAIR(3));
-            printw("  (Enter=set, ESC=cancel, Backspace=delete)");
-        } else if (viewadsb_ownship_hex != 0) {
-            // Show current ownship hex
-            if (has_colors()) attron(COLOR_PAIR(3));
-            printw("Ownship: %06X", viewadsb_ownship_hex);
-            if (has_colors()) attroff(COLOR_PAIR(3));
-            printw("  (type to change, Enter=clear)");
-        } else if (viewadsb_ownship_callsign[0] != '\0') {
-            // Show current ownship callsign
-            if (has_colors()) attron(COLOR_PAIR(3));
-            printw("Ownship: %s", viewadsb_ownship_callsign);
-            if (has_colors()) attroff(COLOR_PAIR(3));
-            printw("  (type to change, Enter=clear)");
+            printw("  (Enter=set, ESC=cancel)");
         } else {
-            printw("Type hex ID or callsign to set ownship");
+            // Show normal status
+            printw("Sort:%s%s ", sort_mode_names[current_sort_mode], sort_ascending ? "+" : "-");
+            if (viewadsb_ownship_hex != 0) {
+                printw(" Ownship:%06X", viewadsb_ownship_hex);
+            } else if (viewadsb_ownship_callsign[0] != '\0') {
+                printw(" Ownship:%s", viewadsb_ownship_callsign);
+            }
+            printw("  [o]=ownship [s]=sort [q]=reverse");
         }
     }
 
