@@ -3813,6 +3813,27 @@ void sendOwnshipCommand(int fd, char type, const char *value) {
     }
 }
 
+// Broadcast current gain to all beast output clients
+// Called when gain changes
+void broadcastGain(void) {
+    if (!Modes.beast_out.connections) {
+        return;
+    }
+    
+    // Format: 0x1a + G + 2 bytes (int16_t big-endian)
+    char *p = prepareWrite(&Modes.beast_out, 4);
+    if (!p) {
+        return;
+    }
+    
+    *p++ = 0x1a;
+    *p++ = 'G';
+    *p++ = (Modes.gain >> 8) & 0xFF;  // High byte
+    *p++ = Modes.gain & 0xFF;          // Low byte
+    
+    completeWrite(&Modes.beast_out, p);
+}
+
 static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struct messageBuffer *mb) {
     MODES_NOTUSED(c);
     MODES_NOTUSED(remote);
@@ -4029,6 +4050,11 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                 fprintf(stderr, "Ownship cleared by client\n");
                 break;
         }
+    } else if (p[0] == 'G') {
+        // Gain command from readsb server
+        // Format: G + 2 bytes (int16_t big-endian, gain in tenths of dB)
+        int16_t gain = ((uint8_t)p[1] << 8) | (uint8_t)p[2];
+        Modes.received_gain = gain;
     }
     return 0;
 }
@@ -4929,6 +4955,9 @@ static int readBeastcommand(struct client *c, int64_t now, struct messageBuffer 
                 ++c->som;
                 continue;
             }
+        } else if (*p == 'G') { // Gain command from readsb
+            // Format: G + 2 bytes (int16_t gain)
+            eom = p + 3;
         } else {
             // Not a valid beast command, skip 0x1a and try again
             ++c->som;
@@ -5360,6 +5389,18 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
                 }
             }
             c->som += 2;
+            continue;
+        } else if (ch == 'G') {
+            // Gain command from readsb server
+            // Format: 0x1a + G + 2 bytes (int16_t big-endian, gain in tenths of dB)
+            p++;
+            if (p + 2 > c->eod) {
+                // Incomplete, wait for more data
+                break;
+            }
+            int16_t gain = ((uint8_t)p[0] << 8) | (uint8_t)p[1];
+            Modes.received_gain = gain;
+            c->som += 4;  // 0x1a + G + 2 bytes
             continue;
         } else {
             // Not a valid beast message, skip 0x1a

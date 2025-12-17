@@ -591,6 +591,7 @@ struct _Modes
     uint32_t noiseHighThreshold;
     int minGain;
     int gain;
+    int received_gain;  // Gain received from readsb (for viewadsb)
     int dc_filter; // should we apply a DC filter?
     int enable_agc;
     sdr_type_t sdr_type; // where are we getting data from?

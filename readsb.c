@@ -907,6 +907,7 @@ static void gainStatistics(struct mag_buf *buf) {
             reason = "increasing gain, noise too low:             ";
         }
         sdrSetGain(reason);
+        broadcastGain();  // Send new gain to beast clients
         if (Modes.gain == MODES_RTL_AGC) {
             // switching to AGC is only done every 5 minutes to avoid oscillations due to the large step
             nextRaiseAgc = buf->sysTimestamp + 5 * MINUTES;
@@ -1376,6 +1377,13 @@ static void backgroundTasks(int64_t now) {
 
     // GDL90 UDP output
     gdl90PeriodicWork();
+
+    // Broadcast gain to beast clients periodically (for new connections)
+    static int64_t next_gain_broadcast;
+    if (now > next_gain_broadcast) {
+        next_gain_broadcast = now + 5 * SECONDS;
+        broadcastGain();
+    }
 
     // Refresh screen when in interactive mode
     static int64_t next_interactive;

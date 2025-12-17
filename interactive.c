@@ -319,7 +319,7 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
     char strGs[5] = " ";
     char strIAS[5] = " ";
     char strTAS[5] = " ";
-    char strMach[5] = " ";
+    char strMach[6] = " ";
     char strTrackRate[5] = " ";
     char strRoll[6] = " ";
     char strOAT[5] = " ";
@@ -382,7 +382,7 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
     }
 
     if (trackDataValid(&a->mach_valid)) {
-        snprintf(strMach, 5, "%01.3f", a->mach);
+        snprintf(strMach, 6, "%5.3f", a->mach);
     }
 
     if (trackDataValid(&a->track_valid)) {
@@ -531,7 +531,7 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
     if (has_colors()) attroff(COLOR_PAIR(1));
 
     // White: BaroAlt, BaRt, GPSAlt, GmRt, GSP, IAS, TAS, Mach
-    printw(" %6s %5s %6s %5s  %3s  %3s  %3s  %4s  ",
+    printw(" %6s %5s %6s %5s  %3s  %3s  %3s %5s  ",
            strFl, strBaroRate, strGPSAlt, strGeomRate, strGs, strIAS, strTAS, strMach);
 
     // Green: OAT, TAT, WD, WS
@@ -625,6 +625,25 @@ void interactiveShowData(void) {
         // Print receiver info line (viewadsb only)
         if (Modes.viewadsb) {
             move(0, 0);
+            
+            // Count valid targets
+            struct craftArray *ca_count = &Modes.aircraftActive;
+            int target_count = 0;
+            for (int i = 0; i < ca_count->len; i++) {
+                struct aircraft *a = ca_count->list[i];
+                if (a && a->messages > 1 && (now - a->seen) < Modes.interactive_display_ttl) {
+                    target_count++;
+                }
+            }
+            printw("Tgt:%d", target_count);
+            
+            // Show gain if received from readsb
+            if (Modes.received_gain != 0 && Modes.received_gain != MODES_MAX_GAIN && Modes.received_gain != MODES_AUTO_GAIN) {
+                printw("  Gain:%.1fdB", Modes.received_gain / 10.0);
+            }
+            
+            printw("  ");
+            
             double ref_lat, ref_lon, ref_alt_m;
             if (getRefPosition(&ref_lat, &ref_lon, &ref_alt_m)) {
                 const char *pos_source = (viewadsb_ownship_hex != 0 || viewadsb_ownship_callsign[0] != '\0') ? "Ownship" : "Receiver";
@@ -638,10 +657,6 @@ void interactiveShowData(void) {
                     }
                 }
                 if (has_colors()) attroff(COLOR_PAIR(3));
-                // Show gain if available (readsb only, viewadsb doesn't have gain info)
-                if (!Modes.viewadsb && Modes.gain != MODES_AUTO_GAIN && Modes.gain != MODES_MAX_GAIN && Modes.gain != 0) {
-                    printw("  Gain: %.1fdB", Modes.gain / 10.0);
-                }
             } else {
                 printw("No receiver position set (use --lat/--lon or set ownship)");
             }
@@ -654,7 +669,7 @@ void interactiveShowData(void) {
         if (has_colors()) attron(COLOR_PAIR(1));
         printw("APMode        QNH SelAl SelHd");
         if (has_colors()) attroff(COLOR_PAIR(1));
-        printw(" BaroAlt  BaRt GPSAlt  GmRt  GSP  IAS  TAS  Mach  ");
+        printw(" BaroAlt  BaRt GPSAlt  GmRt  GSP  IAS  TAS Mach   ");
         if (has_colors()) attron(COLOR_PAIR(2));
         printw("OAT  TAT  WD   WS");
         if (has_colors()) attroff(COLOR_PAIR(2));
