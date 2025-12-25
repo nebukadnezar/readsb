@@ -46,7 +46,6 @@ void argp_help(struct argp_state *state)
     printf("  --%-*s%s\n", state->maxlen+6, "help", "Give this help list");
     printf("  --%-*s%s\n", state->maxlen+6, "usage",
            "Give a short usage message");
-    printf("\nCredits:\n%s\n", argp_program_credits);
     printf("\nReport bugs to %s\n", argp_program_bug_address);
 }
 
@@ -113,21 +112,20 @@ int argp_parse(struct argp *argp, int argc, char **argv, int flags, int tmp, voi
         }
     }
 
-    // deal with version / usage / help stuff
-    if (argc >= 2) {
-        if (strcmp(argv[1], "-V") == 0 || strcmp(argv[1], "--version") == 0) {
+    // deal with version / usage / help stuff - scan all arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
             fprintf(stderr, "%s\n", argp_program_version);
-            exit(argc == 2 ? 0 : 1);
+            exit(0);
         }
-        if (strcmp(argv[1], "-?") == 0 || strcmp(argv[1], "--help") == 0) {
+        if (strcmp(argv[i], "-?") == 0 || strcmp(argv[i], "--help") == 0) {
             argp_help(&state);
-            exit(argc == 2 ? 0 : 1);
+            exit(0);
         }
-        if (strcmp(argv[1], "--usage") == 0) {
+        if (strcmp(argv[i], "--usage") == 0) {
             argp_usage(&state);
-            exit(argc == 2 ? 0 : 1);
+            exit(0);
         }
-
     }
 
     /* we only accept long arguments - return value is zero, and 'long_index'
