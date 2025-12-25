@@ -1029,6 +1029,27 @@ static void addReceiverId(struct aircraft *a, struct modesMessage *mm, int64_t e
     a->receiverCount = div;
 }
 
+#if defined(WITH_UUIDS)
+static void setRecentReceiverIds(struct aircraft *a, struct modesMessage *mm, int64_t now) {
+    int64_t oldestTime = now;
+    int64_t overwriteOlder = now - 60 * SECONDS;
+    idTime *overwrite = &a->recentReceiverIds[0];
+    for (int i = 0; i < RECENT_RECEIVER_IDS; i++) {
+        idTime *entry = &a->recentReceiverIds[i];
+        if (entry->id == mm->receiverId || entry->time < overwriteOlder) {
+            overwrite = entry;
+            break;
+        }
+        if (entry->time < oldestTime) {
+            oldestTime = entry->time;
+            overwrite = entry;
+        }
+    }
+    overwrite->id = mm->receiverId;
+    overwrite->time = now;
+}
+#endif
+
 static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now) {
     if (0 && a->addr == Modes.cpr_focus) {
         showPositionDebug(a, mm, now, 0, 0);
@@ -1074,26 +1095,7 @@ static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now
     }
 
 #if defined(WITH_UUIDS)
-    {
-        int64_t oldestTime = now;
-        int64_t overwriteOlder = now - 60 * SECONDS;
-        idTime *overwrite = &a->recentReceiverIds[0];
-        for (int i = 0; i < RECENT_RECEIVER_IDS; i++) {
-            idTime *entry = &a->recentReceiverIds[i];
-            if (entry->id == mm->receiverId) {
-                overwrite = entry;
-                break;
-            }
-            // if we already found an entry to overwrite (older than 60 seconds)
-            // then look no further for an entry to overwrite
-            if (oldestTime > overwriteOlder && entry->time < oldestTime) {
-                oldestTime = entry->time;
-                overwrite = entry;
-            }
-        }
-        overwrite->id = mm->receiverId;
-        overwrite->time = now;
-    }
+    setRecentReceiverIds(a, mm, now);
 #endif
 
     if (mm->duplicate) {
@@ -2801,6 +2803,12 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         }
     }
 
+#if defined(WITH_UUIDS)
+    if (a->position_valid.source < SOURCE_TISB) {
+        setRecentReceiverIds(a, mm, now);
+    }
+#endif
+
     if (mm->msgtype == 11 && mm->IID == 0 && mm->correctedbits == 0) {
         if (Modes.net_output_json_include_nopos && now > a->nextJsonPortOutput
                 && now - a->seenPosReliable > 10 * SECONDS && now - a->seenPosReliable > 2 * Modes.net_output_json_interval) {
@@ -3273,7 +3281,7 @@ void trackRemoveStale(int64_t now) {
 
     int64_t elapsed3 = lapWatch(&watch);
 
-    if (elapsed1 + elapsed2 + elapsed3 > 25) {
+    if (elapsed1 + elapsed2 + elapsed3 > 51) {
         fprintf(stderr, "trackRemoveStale elapsed: %4ld %4ld %4ld\n", (long) elapsed1, (long) elapsed2, (long) elapsed3);
     }
 }

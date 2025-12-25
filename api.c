@@ -835,8 +835,8 @@ static inline int apiAdd(struct apiBuffer *buffer, struct aircraft *a, int64_t n
     toBinCraft(a, &entry->bin, now);
 
 #if defined(WITH_UUIDS)
-    // only include receivers if they have received the plane within the update interval
-    int64_t printNewer = now - Modes.json_interval;
+    // only include receivers if they have received the plane within the 2x the update interval
+    int64_t printNewer = now - 2 * Modes.json_interval;
     for (int i = 0; i < RECENT_RECEIVER_IDS; i++) {
         entry->recentReceiverIds[i] = (a->recentReceiverIds[i].time > printNewer) ? a->recentReceiverIds[i].id : 0;
     }
@@ -1644,7 +1644,7 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
 
     int req_len = request->len;
     char *req_start = request->buffer;
-    char *newline = memchr(req_start + oldlen, '\n', req_len);
+    char *newline = memchr(req_start + oldlen, '\n', req_len - oldlen);
     if (!newline || !strstr(req_start + imax(0, oldlen - 4), "\r\n\r\n")) {
         // request not complete
         return;
