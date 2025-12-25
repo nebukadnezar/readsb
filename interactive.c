@@ -211,13 +211,9 @@ static double calculate3DDistance(double ref_lat, double ref_lon, double ref_alt
 // Set ownship from input string (hex or callsign)
 static void setOwnshipFromInput(const char *input) {
     if (!input || input[0] == '\0') {
-        // Clear ownship
+        // Clear ownship - the periodic function will send the clear command
         viewadsb_ownship_hex = 0;
         viewadsb_ownship_callsign[0] = '\0';
-        // Send clear to server
-        if (Modes.net_connectors_count > 0 && Modes.net_connectors[0].connected) {
-            sendOwnshipCommand(Modes.net_connectors[0].fd, 'X', NULL);
-        }
         return;
     }
 
@@ -236,10 +232,6 @@ static void setOwnshipFromInput(const char *input) {
         // Treat as hex ID
         viewadsb_ownship_hex = (uint32_t)strtol(input, NULL, 16);
         viewadsb_ownship_callsign[0] = '\0';
-        // Send to server
-        if (Modes.net_connectors_count > 0 && Modes.net_connectors[0].connected) {
-            sendOwnshipCommand(Modes.net_connectors[0].fd, 'H', input);
-        }
     } else {
         // Treat as callsign
         viewadsb_ownship_hex = 0;
@@ -251,11 +243,8 @@ static void setOwnshipFromInput(const char *input) {
                 viewadsb_ownship_callsign[i] -= 32;
             }
         }
-        // Send to server
-        if (Modes.net_connectors_count > 0 && Modes.net_connectors[0].connected) {
-            sendOwnshipCommand(Modes.net_connectors[0].fd, 'C', viewadsb_ownship_callsign);
-        }
     }
+    // The periodic interactiveSendOwnship() will detect the change and send to server
 }
 
 // Initialize ownship from command line (called after connection established)
@@ -263,35 +252,58 @@ static void setOwnshipFromInput(const char *input) {
 void interactiveSendOwnship(void) {
     if (!Modes.viewadsb) return;
 
-    // Rate limit: only send every 5 seconds
-    static int64_t last_send = 0;
-    int64_t now = mstime();
-    if (now - last_send < 5000) return;
-    last_send = now;
+    // Track what we last sent to avoid repeated sends
+    static uint32_t last_sent_hex = 0;
+    static char last_sent_callsign[9] = "";
+    static int64_t last_connect_time = 0;
 
     // Check if we have an active connection
     if (Modes.net_connectors_count == 0) return;
     struct net_connector *con = &Modes.net_connectors[0];
     if (!con->connected || con->fd < 0) return;
 
-    // Check if ownship was set (either from command line or runtime input)
-    if (viewadsb_ownship_hex != 0) {
-        char hexstr[8];
-        snprintf(hexstr, sizeof(hexstr), "%06X", viewadsb_ownship_hex);
-        sendOwnshipCommand(con->fd, 'H', hexstr);
-    } else if (viewadsb_ownship_callsign[0] != '\0') {
-        sendOwnshipCommand(con->fd, 'C', viewadsb_ownship_callsign);
+    // Detect reconnection by checking if connection timestamp changed
+    int reconnected = (con->lastConnect != last_connect_time);
+    if (reconnected) {
+        last_connect_time = con->lastConnect;
+        // Reset last sent values to force resend after reconnection
+        last_sent_hex = 0;
+        last_sent_callsign[0] = '\0';
     }
-    // If neither is set, check if command line had one (first-time setup)
-    else if (Modes.ownship_hex != 0) {
-        viewadsb_ownship_hex = Modes.ownship_hex;
-        char hexstr[8];
-        snprintf(hexstr, sizeof(hexstr), "%06X", Modes.ownship_hex);
-        sendOwnshipCommand(con->fd, 'H', hexstr);
-    } else if (Modes.ownship_callsign[0] != '\0') {
-        strncpy(viewadsb_ownship_callsign, Modes.ownship_callsign, 8);
-        viewadsb_ownship_callsign[8] = '\0';
-        sendOwnshipCommand(con->fd, 'C', viewadsb_ownship_callsign);
+
+    // Check if ownship was set from command line (first-time setup)
+    if (viewadsb_ownship_hex == 0 && viewadsb_ownship_callsign[0] == '\0') {
+        if (Modes.ownship_hex != 0) {
+            viewadsb_ownship_hex = Modes.ownship_hex;
+        } else if (Modes.ownship_callsign[0] != '\0') {
+            strncpy(viewadsb_ownship_callsign, Modes.ownship_callsign, 8);
+            viewadsb_ownship_callsign[8] = '\0';
+        }
+    }
+
+    // Only send if changed from what we last sent
+    if (viewadsb_ownship_hex != 0) {
+        if (viewadsb_ownship_hex != last_sent_hex || last_sent_callsign[0] != '\0') {
+            char hexstr[8];
+            snprintf(hexstr, sizeof(hexstr), "%06X", viewadsb_ownship_hex);
+            sendOwnshipCommand(con->fd, 'H', hexstr);
+            last_sent_hex = viewadsb_ownship_hex;
+            last_sent_callsign[0] = '\0';
+        }
+    } else if (viewadsb_ownship_callsign[0] != '\0') {
+        if (strcmp(viewadsb_ownship_callsign, last_sent_callsign) != 0 || last_sent_hex != 0) {
+            sendOwnshipCommand(con->fd, 'C', viewadsb_ownship_callsign);
+            strncpy(last_sent_callsign, viewadsb_ownship_callsign, 8);
+            last_sent_callsign[8] = '\0';
+            last_sent_hex = 0;
+        }
+    } else {
+        // No ownship set - send clear if we previously had one
+        if (last_sent_hex != 0 || last_sent_callsign[0] != '\0') {
+            sendOwnshipCommand(con->fd, 'X', NULL);
+            last_sent_hex = 0;
+            last_sent_callsign[0] = '\0';
+        }
     }
 }
 
