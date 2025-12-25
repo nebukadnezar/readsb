@@ -1947,21 +1947,18 @@ static void modesSendRawOutput(struct modesMessage *mm) {
 //
 // Read Asterix FSPEC
 //
-#define FSPEC_MAX 24
-static void readFspec(uint8_t *fspec, char **p, char *end){
-    memset(fspec, 0x0, FSPEC_MAX);
-
-    if (*p >= end) {
-        return;
+static uint8_t * readFspec(char **p){
+    uint8_t* fspec = malloc(24*sizeof(uint8_t*));
+    for (int i = 1; i < 24; i++) {
+    	fspec[i] = 0;
     }
-
     fspec[0] = **p;
     (*p)++;
-
-    for (int i = 1; i < FSPEC_MAX && *p < end && *(*p - 1) & 0x1; i++){
-        fspec[i] = *(*p);
-        (*p)++;
+    for (int i = 1; *(*p - 1) & 0x1; i++){
+    	fspec[i] = *(*p);
+	(*p)++;
     }
+    return fspec;
 }
 
 //
@@ -2021,10 +2018,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
     mm->signalLevel = 0;
     category = *p; // Get the category
     p += 3;
-
-    uint8_t fspec[FSPEC_MAX];
-    readFspec(fspec, &p, c->eod);
-
+    uint8_t *fspec = readFspec(&p);
     mm->receiverId = c->receiverId;
     if (unlikely(Modes.incrementId)) {
         mm->receiverId += now / (10 * MINUTES);
@@ -2033,6 +2027,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
     switch(category){
         case 21: // ADS-B Message
             if(!(fspec[1] & 0x10)){ // no address. this is useless to us
+                free(fspec);
                 return -1;
             }
             if (fspec[0] & 0x80){ // ID021/010 Data Source Identification
@@ -2040,8 +2035,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
             }
             uint8_t addrtype = 3;
             if (fspec[0] & 0x40){ // ID021/040 Target Report Descriptor
-                uint8_t trd[FSPEC_MAX];
-                readFspec(trd, &p, c->eod);
+                uint8_t *trd = readFspec(&p);
                 addrtype = (trd[0] & 0xE0) >> 5;
                 if (!(trd[0] & 0x18)){
                     mm->alt_q_bit = 1;
@@ -2052,6 +2046,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 else {
                     mm->airground = AG_AIRBORNE;
                 }
+                free(trd);
             }
             if (fspec[0] & 0x20){ // I021/161 Track Number
                 p += 2;
@@ -2184,7 +2179,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
                 p += 2;
             }
-            uint8_t qi[FSPEC_MAX];
+            uint8_t *qi;
             //uint8_t nucp_or_nic;
             uint8_t nucr_or_nacv;
             uint8_t nicbaro = 0;
@@ -2195,7 +2190,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
             uint8_t gva = 0;
             //uint8_t pic;
             if (fspec[2] & 0x20){ // I021/090 Quality Indicators
-                readFspec(qi, &p, c->eod);
+                qi = readFspec(&p);
                 //nucp_or_nic = (qi[0] & 0x1e) >> 1;
                 nucr_or_nacv = (qi[0] & 0xe0) >> 5;
                 mm->accuracy.nac_v_valid = true;
@@ -2221,6 +2216,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                         mm->accuracy.sil_type = SIL_UNKNOWN;
                     }
                 }
+                free(qi);
             }
             if (fspec[2] & 0x10){ // I021/210 MOPS Version
                 mm->opstatus.valid = true;
@@ -2460,8 +2456,8 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
             }
 
             if (fspec[4] & 0x20) { // I021/220 Met Information
-                uint8_t met[FSPEC_MAX];
-                readFspec(met, &p, c->eod);
+                uint8_t *met = readFspec(&p);
+                free(met);
             }
 
             if (fspec[4] & 0x10) { // I021/146 Selected Altitude
@@ -2484,6 +2480,7 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
             netUseMessage(mm);
             break;
     }
+    free(fspec);
     if (mm->sysTimestamp == -1){
         mm->sysTimestamp = mstime();
     }
@@ -4237,6 +4234,13 @@ static int decodeBinMessage(struct client *c, char *p, int remote, int64_t now, 
 }
 
 
+// Planefinder uses bit stuffing, so if we see a DLE byte, we need the next byte
+static inline unsigned char getNextPfUnstuffedByte(char **p) {
+    if (**p == DLE) {
+        (*p)++;
+    }
+    return *(*p)++;
+}
 //
 //
 //=========================================================================
@@ -4264,14 +4268,6 @@ static int decodeBinMessage(struct client *c, char *p, int remote, int64_t now, 
 static int decodePfMessage(struct client *c, char *p, int remote, int64_t now, struct messageBuffer *mb) {
     MODES_NOTUSED(remote);
 
-// Planefinder uses bit stuffing, so if we see a DLE byte, we need the next byte
-#define nextByte do { \
-    if (p >= c->eod) { return 0; } \
-    if (*p == DLE) { p++; } \
-    if (p >= c->eod) { return 0; } \
-    ch = *p++; \
-} while (0)
-
     int msgLen = 0;
     int j;
     unsigned char ch;
@@ -4285,18 +4281,17 @@ static int decodePfMessage(struct client *c, char *p, int remote, int64_t now, s
     p++;
 
     // Packet ID / type
-    nextByte; /// Get the message type
+    ch = getNextPfUnstuffedByte(&p); /// Get the message type
     // This shouldn't happen because we check it in the readPlanefinder() function
     if (ch != 0xc1) {
         return 0;
     }
 
     // Padding
-    nextByte;
-
+    getNextPfUnstuffedByte(&p);
 
     // Packet type
-    nextByte;
+    ch = getNextPfUnstuffedByte(&p);
     if (ch & 0x10) {
         // CRC: ignore field
     }
@@ -4317,20 +4312,20 @@ static int decodePfMessage(struct client *c, char *p, int remote, int64_t now, s
     }
 
     // Signal strength
-    nextByte;
+    ch = getNextPfUnstuffedByte(&p);
     mm->signalLevel = ((unsigned char) ch / 255.0);
     mm->signalLevel = mm->signalLevel * mm->signalLevel; // square it to get power
 
     mm->timestamp = 0;
     int64_t seconds = 0;
     for (j = 0; j < 4; j++) {
-        nextByte;
+        ch = getNextPfUnstuffedByte(&p);
         seconds = seconds << 8 | (ch & 255);
     }
 
     int64_t nanoseconds = 0;
     for (j = 0; j < 4; j++) {
-        nextByte;
+        ch = getNextPfUnstuffedByte(&p);
         nanoseconds = nanoseconds << 8 | (ch & 255);
     }
 
@@ -4343,8 +4338,7 @@ static int decodePfMessage(struct client *c, char *p, int remote, int64_t now, s
     mm->sysTimestamp = now;
 
     for (j = 0; j < msgLen; j++) { // and the data
-        nextByte;
-        msg[j] = ch;
+        msg[j] = getNextPfUnstuffedByte(&p);
     }
 
     int result = -10;
@@ -4377,8 +4371,6 @@ static int decodePfMessage(struct client *c, char *p, int remote, int64_t now, s
 
     netUseMessage(mm);
     return 0;
-
-#undef nextByte
 }
 
 // exception decoding subroutine, return 1 for success, 0 for failure
@@ -5045,16 +5037,8 @@ static int readAscii(struct client *c, int64_t now, struct messageBuffer *mb) {
 static int readAsterix(struct client *c, int64_t now, struct messageBuffer *mb) {
 
     while (c->som < c->eod) {
-        if (c->eod - c->som < 3) {
-            // incomplete header, wait for more data
-            break;
-        }
         char *p = c->som;
         uint16_t msgLen = (*(p + 1) << 8) + *(p + 2);
-        if (msgLen < 3 || c->som + msgLen > c->eod) {
-            // invalid or incomplete messages
-            break;
-        }
         char *end = c->som + msgLen;
         c->som = end;
         if (c->service->read_handler(c, p, c->remote, now, mb)) {
@@ -5136,7 +5120,7 @@ static int readPlanefinder(struct client *c, int64_t now, struct messageBuffer *
         }
 
         // Pass message to handler.
-        if (decodePfMessage(c, start, c->remote, now, mb)) {
+        if (c->service->read_handler(c, start, c->remote, now, mb)) {
             modesCloseClient(c);
             return -1;
         }
@@ -5533,16 +5517,9 @@ static int readProxy(struct client *c) {
         // expected string example: "PROXY TCP4 172.12.2.132 172.191.123.45 40223 30005"
 
         char *space = proxy;
-        for (int i = 0; i < 3; i++) {
-            if (!space) {
-                break; // check to avoid null deref
-            }
-            space = memchr(space + 1, ' ', eop - space - 1);
-        }
-        if (!space) {
-            // incomplete proxy string
-            return -2;
-        }
+        space = memchr(space + 1, ' ', eop - space - 1);
+        space = memchr(space + 1, ' ', eop - space - 1);
+        space = memchr(space + 1, ' ', eop - space - 1);
         // hash up to 3rd space
         if (eop - proxy > 10) {
             //fprintf(stderr, "%ld %ld %s\n", eop - proxy, space - proxy, space);
@@ -7452,49 +7429,69 @@ void gdl90Init(void) {
     // Initialize CRC table
     gdl90CrcInit();
 
-    // Create listening socket for EFB discovery broadcasts (port 63093)
-    Modes.gdl90_listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (Modes.gdl90_listen_fd < 0) {
-        fprintf(stderr, "GDL90: Failed to create listen socket: %s\n", strerror(errno));
-        Modes.gdl90_enabled = 0;
-        return;
-    }
-
-    // Allow address reuse
-    int reuse = 1;
-    setsockopt(Modes.gdl90_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-    setsockopt(Modes.gdl90_listen_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
-
-    // Bind to discovery port
-    struct sockaddr_in listen_addr;
-    memset(&listen_addr, 0, sizeof(listen_addr));
-    listen_addr.sin_family = AF_INET;
-    listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    listen_addr.sin_port = htons(GDL90_LISTEN_PORT);
-
-    if (bind(Modes.gdl90_listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
-        fprintf(stderr, "GDL90: Failed to bind to port %d: %s\n", GDL90_LISTEN_PORT, strerror(errno));
-        close(Modes.gdl90_listen_fd);
-        Modes.gdl90_listen_fd = -1;
-        Modes.gdl90_enabled = 0;
-        return;
-    }
-
     // Create sending socket for GDL90 data
     Modes.gdl90_send_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (Modes.gdl90_send_fd < 0) {
         fprintf(stderr, "GDL90: Failed to create send socket: %s\n", strerror(errno));
-        close(Modes.gdl90_listen_fd);
-        Modes.gdl90_listen_fd = -1;
         Modes.gdl90_enabled = 0;
         return;
     }
 
+    // If static IP is configured, set up target address directly
+    if (Modes.gdl90_ip) {
+        memset(&Modes.gdl90_target_addr, 0, sizeof(Modes.gdl90_target_addr));
+        Modes.gdl90_target_addr.sin_family = AF_INET;
+        Modes.gdl90_target_addr.sin_port = htons(Modes.gdl90_port);
+        if (inet_pton(AF_INET, Modes.gdl90_ip, &Modes.gdl90_target_addr.sin_addr) != 1) {
+            fprintf(stderr, "GDL90: Invalid IP address: %s\n", Modes.gdl90_ip);
+            close(Modes.gdl90_send_fd);
+            Modes.gdl90_send_fd = -1;
+            Modes.gdl90_enabled = 0;
+            return;
+        }
+        Modes.gdl90_target_valid = 1;
+        fprintf(stderr, "GDL90: Sending to %s:%d\n", Modes.gdl90_ip, Modes.gdl90_port);
+    } else {
+        // No static IP - set up discovery listener
+        // Create listening socket for EFB discovery broadcasts (port 63093)
+        Modes.gdl90_listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (Modes.gdl90_listen_fd < 0) {
+            fprintf(stderr, "GDL90: Failed to create listen socket: %s\n", strerror(errno));
+            close(Modes.gdl90_send_fd);
+            Modes.gdl90_send_fd = -1;
+            Modes.gdl90_enabled = 0;
+            return;
+        }
+
+        // Allow address reuse
+        int reuse = 1;
+        setsockopt(Modes.gdl90_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(Modes.gdl90_listen_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+
+        // Bind to discovery port
+        struct sockaddr_in listen_addr;
+        memset(&listen_addr, 0, sizeof(listen_addr));
+        listen_addr.sin_family = AF_INET;
+        listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        listen_addr.sin_port = htons(GDL90_LISTEN_PORT);
+
+        if (bind(Modes.gdl90_listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+            fprintf(stderr, "GDL90: Failed to bind to port %d: %s\n", GDL90_LISTEN_PORT, strerror(errno));
+            close(Modes.gdl90_listen_fd);
+            Modes.gdl90_listen_fd = -1;
+            close(Modes.gdl90_send_fd);
+            Modes.gdl90_send_fd = -1;
+            Modes.gdl90_enabled = 0;
+            return;
+        }
+
+        fprintf(stderr, "GDL90: Listening for EFB announcements on port %d\n", GDL90_LISTEN_PORT);
+    }
+
     Modes.gdl90_next_update = mono_milli_seconds();
     Modes.gdl90_ahrs_next_update = mono_milli_seconds();
-    fprintf(stderr, "GDL90: Listening for EFB announcements on port %d\n", GDL90_LISTEN_PORT);
 }
 
 void gdl90Close(void) {
@@ -7515,13 +7512,16 @@ void gdl90PeriodicWork(void) {
 
     int64_t mono = mono_milli_seconds();
 
-    // Check for EFB discovery broadcasts
-    gdl90ProcessDiscovery();
+    // Only process discovery and timeout if not using static IP
+    if (!Modes.gdl90_ip) {
+        // Check for EFB discovery broadcasts
+        gdl90ProcessDiscovery();
 
-    // Check if target has timed out (use monotonic time)
-    if (Modes.gdl90_target_valid && mono > Modes.gdl90_target_timeout) {
-        fprintf(stderr, "GDL90: EFB connection timed out\n");
-        Modes.gdl90_target_valid = 0;
+        // Check if target has timed out (use monotonic time)
+        if (Modes.gdl90_target_valid && mono > Modes.gdl90_target_timeout) {
+            fprintf(stderr, "GDL90: EFB connection timed out\n");
+            Modes.gdl90_target_valid = 0;
+        }
     }
 
     // Only send if we have a valid target

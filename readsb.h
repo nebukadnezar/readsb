@@ -985,6 +985,8 @@ struct _Modes
 
     // GDL90 output configuration
     int gdl90_enabled;              // Whether GDL90 output is enabled
+    char *gdl90_ip;                 // Static IP address to send GDL90 data to (overrides discovery)
+    int gdl90_port;                 // Port for static IP (default 4000)
     int gdl90_listen_fd;            // UDP socket for listening to EFB announcements (port 63093)
     int gdl90_send_fd;              // UDP socket for sending GDL90 data
     struct sockaddr_in gdl90_target_addr;  // Target address discovered from EFB announcement
@@ -1403,6 +1405,7 @@ enum {
     OptSendXgps,
     OptSendXtraffic,
     OptGdl90,
+    OptGdl90Ip,
 };
 
 

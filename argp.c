@@ -46,7 +46,13 @@ void argp_help(struct argp_state *state)
     printf("  --%-*s%s\n", state->maxlen+6, "help", "Give this help list");
     printf("  --%-*s%s\n", state->maxlen+6, "usage",
            "Give a short usage message");
-    printf("\nReport bugs to %s\n", argp_program_bug_address);
+    printf("\nBased on code written by the following authors:\n");
+    printf("2012 by Salvatore Sanfilippo <antirez@gmail.com>\n");
+    printf("2014-2016 Oliver Jowett <oliver@mutability.co.uk>\n");
+    printf("2019 Michael Wolf <michael@mictronics.de>\n");
+    printf("2020 Matthias Wirth <matthias.wirth@gmail.com>\n");
+    printf("2025 Balthasar Indermuehle <balt@inside.net> (GDL90 and EFB integration)\n");
+    printf("\nReport bugs to Matthias Wirth <matthias.wirth@gmail.com>\n");
 }
 
 void argp_usage(struct argp_state *state)

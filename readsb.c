@@ -1759,6 +1759,24 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.net = 1;
             fprintf(stderr, "GDL90 output enabled (listening for EFB announcements)\n");
             break;
+        case OptGdl90Ip:
+            {
+                // Parse ip[:port] format
+                char *colon = strchr(arg, ':');
+                if (colon) {
+                    *colon = '\0';
+                    Modes.gdl90_ip = strdup(arg);
+                    Modes.gdl90_port = atoi(colon + 1);
+                    *colon = ':'; // restore the string
+                } else {
+                    Modes.gdl90_ip = strdup(arg);
+                    Modes.gdl90_port = 4000; // Default GDL90 port
+                }
+                Modes.gdl90_enabled = 1;
+                Modes.net = 1;
+                fprintf(stderr, "GDL90 output enabled, sending to %s:%d\n", Modes.gdl90_ip, Modes.gdl90_port);
+            }
+            break;
         case OptDevice:
             Modes.dev_name = strdup(arg);
             break;
