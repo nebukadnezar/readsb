@@ -25,12 +25,13 @@ For macOS build and info, check the [macOS](##macos) section
 
 ## Credits / history
 
-antirez (original dump1090)
-Malcom Robb (work on his dump1090 fork)
-mutability (forked to dump1090-mutability and further to dump1090-fa)
-Mictronics (readsb as a fork of dump1090-fa)
-wiedehopf (this fork of Mictronics readsb)
-Balthasar Indermuehle (GDL90/EFB functionality, enhanced viewadsb)
+Based on code written by the following authors:
+- 2012 by Salvatore Sanfilippo <antirez@gmail.com> (original dump1090)
+- Malcom Robb (work on his dump1090 fork)
+- 2014-2016 Oliver Jowett <oliver@mutability.co.uk> (forked to dump1090-mutability and further to dump1090-fa)
+- 2019 Michael Wolf <michael@mictronics.de> (readsb as a fork of dump1090-fa)
+- 2020 Matthias Wirth <matthias.wirth@gmail.com> (this fork of Mictronics readsb)
+- 2025 Balthasar Indermuehle <balt@inside.net> (GDL90/EFB integration, viewadsb enhancements)
 
 ### aircraft.json format:
 
