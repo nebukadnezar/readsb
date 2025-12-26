@@ -47,11 +47,12 @@ void argp_help(struct argp_state *state)
     printf("  --%-*s%s\n", state->maxlen+6, "usage",
            "Give a short usage message");
     printf("\nBased on code written by the following authors:\n");
-    printf("2012 by Salvatore Sanfilippo <antirez@gmail.com>\n");
-    printf("2014-2016 Oliver Jowett <oliver@mutability.co.uk>\n");
-    printf("2019 Michael Wolf <michael@mictronics.de>\n");
-    printf("2020 Matthias Wirth <matthias.wirth@gmail.com>\n");
-    printf("2025 Balthasar Indermuehle <balt@inside.net> (GDL90 and EFB integration)\n");
+    printf("2012 by Salvatore Sanfilippo <antirez@gmail.com> (original dump1090)\n");
+    printf("Malcom Robb (work on his dump1090 fork)\n");
+    printf("2014-2016 Oliver Jowett <oliver@mutability.co.uk> (forked to dump1090-mutability and further to dump1090-fa)\n");
+    printf("2019 Michael Wolf <michael@mictronics.de> (readsb as a fork of dump1090-fa)\n");
+    printf("2020 Matthias Wirth <matthias.wirth@gmail.com> (this fork of Mictronics readsb)\n");
+    printf("2025 Balthasar Indermuehle <balt@inside.net> (GDL90/EFB integration, viewadsb enhancements)\n");
     printf("\nReport bugs to Matthias Wirth <matthias.wirth@gmail.com>\n");
 }
 

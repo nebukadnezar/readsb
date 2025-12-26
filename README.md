@@ -343,15 +343,40 @@ than 24h.
 The classical tar1090 uses traces created via a shell script and served at /tar1090/chunks but running that shell
 script is probably a hassle, so just use the above.
 
+## GDL90 / EFB functionality
+This build allows forwarding of the traffic data to electronic flight bag (EFB) applications such as Foreflight or Garmin Pilot (and doubtlessly a host of others).
+
+You can pass the ```--gdl90``` option to enable automatic EFB discovery of any GDL90 compatible EFBs (e.g. Foreflight) in your LAN, or you can set the EFB's IP address explicitly by passing ```--gdl90-ip 1.2.3.4``` where 1.2.3.4 obviously is the actual IP address of your EFB.
+
+EFBs that support XGPS and XTRAFFIC messages (e.g. Garmin Pilot) are supported by setting the ownship and EFB IP address, as well as telling readsb what to send. For example, passing ```--ownship 7c45ab --sendxgps --sendxtraffic --efb-ip 1.2.3.4``` will send XGPS and XTRAFFIC messages to 1.2.3.4 on the default port 49002 and sets the ownship to the aircraft with the hex id 7c45ab. To only set traffic without setting the ownship, omit the --ownship and --sendxgps command line parameters.
+
+If you're running this in your own airplane (or as a passenger in an airliner), simply run readsb in a screen, then run viewadsb. This is a great solution in aircraft like the 787 where GPS devices inside the cabin won't work due to the electronic window dimming that creates a faraday cage too good for GNSS signals, but the transponder signal of the aircraft still makes it into the cabin. Simply start readsb in one terminal:
+
+``` ./readsb --device-type rtlsdr --gain auto --ppm 0 --net --net-heartbeat 60 --net-ro-size 1250 --net-ro-interval 0.05 --net-ri-port 30001 --net-ro-port 30002 --net-sbs-port 30003 --net-bi-port 30004,30104 --net-bo-port 30005 --net-connector feed.flyrealtraffic.com,30004,beast_reduce_plus_out,uuid=7eff6a72-f1ad-11ef-b4bc-d7b975414c18 --dump-beast=/tmp/beast.dump,60 --quiet --gdl90```
+
+and in another terminal run viewadsb:
+
+```./viewadsb```
+
+And once up and running and you can see your own aircraft in viewadsb, set the ownship to your flight and that will be sent to Foreflight as the ownship, giving you full visibility of where in the world you are (and independent of your inflight entertainment screen).
+
+Also, if your laptop is connected to the inflight internet, you'll be feeding your position into the flyrealtraffic.com system, making many a simulator pilot very happy!
+
+## viewadsb
+viewadsb has some enhanced features now and displays range and bearing to traffic based on the position you're giving it, or based on the ownship position. It also displays the number of targets being decoded, as well as the current receiver gain setting. This can help in optimising the gain setting you pass to readsb.
+
+viewadsb also displays the (almost) full complement of information received via ADS-B, to include NIC, NACp, transmitter category, and in places where enhanced interrogation is active, IAS, TAS, Mach, OAT, track rate, roll, and autopilot selected intent. You can check where in the world these enhanced interrogation modes are active in these two maps:
+
+viewadsb also lets you set the ownship interactively, either by entering the callsign or the hex id.
 
 ## readsb --help
 
 might be out of date, check the command on a freshly compiled version
 
 ```
-Usage: readsb [OPTIONS...] 
-readsb Mode-S/ADSB/TIS Receiver   
-Build options: ENABLE_RTLSDR 
+Usage: readsb [OPTIONS...]
+readsb Mode-S/ADSB/TIS Receiver
+Build options: ENABLE_RTLSDR
 
 
 General options:
@@ -464,6 +489,12 @@ Network options:
   --net-buffer=<n>                                               control some buffer sizes: 8KB * (2^n) (default: n=1, 16KB)
   --net-verbatim                                                 Forward messages unchanged
   --sdr-buffer-size=<KiB>                                        SDR buffer / USB transfer size in kibibytes (default: 256 which is equivalent to around 54 ms using rtl-sdr, option might be ignored in future versions)
+  --ownship=<hex|callsign>                                       Ownship aircraft identifier: ICAO hex ID or flight ID/callsign (used by --sendxgps and GDL90)
+  --efb-ip=<ip[:port]>                                           IP address to send XGPS/XTRAFFIC data to (default port: 49002)
+  --sendxgps                                                     Send XGPS messages for ownship to --efb-ip (requires --ownship)
+  --sendxtraffic                                                 Send XTRAFFIC messages for traffic to --efb-ip
+  --gdl90                                                        Enable GDL90 protocol output. Listens for EFB announcements and sends via UDP unicast.
+  --gdl90-ip=<ip[:port]>                                         Send GDL90 data to this IP address (default port: 4000). Overrides ForeFlight discovery.
 
 RTL-SDR options:
 
@@ -496,12 +527,58 @@ Help options:
   --help                                                         Give this help list
   --usage                                                        Give a short usage message
 
-Credits:
-antirez (original dump1090) 
+Based on code written by the following authors:
+2012 by Salvatore Sanfilippo <antirez@gmail.com> (original dump1090)
 Malcom Robb (work on his dump1090 fork)
-mutability (forked to dump1090-mutability and further to dump1090-fa)
-Mictronics (readsb as a fork of dump1090-fa)
-wiedehopf (this fork of Mictronics readsb)
+2014-2016 Oliver Jowett <oliver@mutability.co.uk> (forked to dump1090-mutability and further to dump1090-fa)
+2019 Michael Wolf <michael@mictronics.de> (readsb as a fork of dump1090-fa)
+2020 Matthias Wirth <matthias.wirth@gmail.com> (this fork of Mictronics readsb)
+2025 Balthasar Indermuehle <balt@inside.net> (GDL90/EFB integration, viewadsb enhancements)
+
+Report bugs to Matthias Wirth <matthias.wirth@gmail.com>
+```
+## viewadsb --help
+```
+Usage: viewadsb [OPTIONS...]
+vieadsb Mode-S/ADSB/TIS commandline viewer
+
+By default, viewadsb will TCP connect to 127.0.0.1:30005 as a data source.
+Typical readsb / dump1090 installs will provide beast data on port 30005.
+
+
+General options:
+  --lat=<lat>                               Reference/receiver surface latitude
+  --lon=<lon>                               Reference/receiver surface longitude
+  --alt=<alt>                               Receiver altitude in meters (or feet with 'ft' suffix, e.g. 1000ft)
+  --no-interactive                          Disable interactive mode, print to stdout
+  --interactive-ttl=<sec>                   Remove from list if idle for <sec> (default: 60)
+  --modeac                                  Enable decoding of SSR Modes 3/A & 3/C
+  --max-range=<dist>                        Absolute maximum range for position decoding (in nm, default: 300)
+  --fix                                     Enable CRC single-bit error correction (default)
+  --no-fix                                  Disable CRC single-bit error correction
+  --metric                                  Use metric units
+  --show-only=<addr>                        Show only messages by given ICAO on stdout
+  --filter-DF=<type>                        Only network forward and display decoded ModeS messages on stdout only show this DF type
+  --receiver-focus=<receiverId>             only process messages from receiverId
+  --cpr-focus=<hex>                         show CPR details for this hex
+  --ownship=<hex|callsign>                  Set ownship by ICAO hex ID or callsign (highlighted in display, sent to readsb for EFB)
+  --quiet                                   Disable output (default)
+  --debug=<flags>                           Debug mode (verbose), n: network, P: CPR, S: speed check
+
+Network options:
+  --net-connector=<IP,PORT,protocol>        connect as TCP client to listen port / TCP server at IP and PORT, can be specified multiple times (viewadsb default: --net-connector 127.0.0.1,30005,beast_in viewadsb first usage overrides default, second usage adds another input/output) Protocols: beast_out, beast_reduce_out, beast_reduce_plus_out, beast_in, raw_out, raw_in, sbs_in, sbs_in_jaero, sbs_out, sbs_out_jaero, vrs_out, json_out, gpsd_in, uat_in, uat_replay_out, planefinder_in, asterix_in, asterix_out (one failover ip/address,port can be specified: primary-address,primary-port,protocol,failover-address,failover-port) (any position in the comma separated list can also be either silent_fail or uuid=<uuid>)
+
+Help options:
+  --help                                    Give this help list
+  --usage                                   Give a short usage message
+
+Based on code written by the following authors:
+2012 by Salvatore Sanfilippo <antirez@gmail.com> (original dump1090)
+Malcom Robb (work on his dump1090 fork)
+2014-2016 Oliver Jowett <oliver@mutability.co.uk> (forked to dump1090-mutability and further to dump1090-fa)
+2019 Michael Wolf <michael@mictronics.de> (readsb as a fork of dump1090-fa)
+2020 Matthias Wirth <matthias.wirth@gmail.com> (this fork of Mictronics readsb)
+2025 Balthasar Indermuehle <balt@inside.net> (GDL90/EFB integration, viewadsb enhancements)
 
 Report bugs to Matthias Wirth <matthias.wirth@gmail.com>
 ```
