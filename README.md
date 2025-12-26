@@ -371,7 +371,7 @@ viewadsb also displays the (almost) full complement of information received via 
 
 ![viewadsb screenshot](viewadsb.jpg)
 
-You can check where in the world these enhanced interrogation modes are active in these two maps:
+You can check where in the world these enhanced interrogation modes are active in these maps:
 
 BDS 4,0 — Selected Vertical Intention
 - MCP/FCU selected altitude
@@ -381,6 +381,7 @@ BDS 4,0 — Selected Vertical Intention
 - Altitude hold mode engaged (status)
 - Approach mode engaged (status)
 - Target altitude source
+https://rtwa.flyrealtraffic.com/BDS4_Global.jpg
 
 BDS 5,0 — Track and Turn Report
 - Roll angle
@@ -388,8 +389,7 @@ BDS 5,0 — Track and Turn Report
 - Ground speed
 - Track angle rate (turn rate)
 - True airspeed (TAS)
-
-BDS 4,0 and 5,0 messages are available here: https://rtwa.flyrealtraffic.com/Param_Global.jpg
+https://rtwa.flyrealtraffic.com/BDS5_Global.jpg
 
 BDS 6,0 — Heading and Speed Report
 - Magnetic heading
@@ -397,10 +397,7 @@ BDS 6,0 — Heading and Speed Report
 - Mach number
 - Barometric altitude rate (vertical rate from barometric source)
 - Inertial vertical velocity (vertical rate from INS/IRS)
-
-BDS 6,0 messages are available here: https://rtwa.flyrealtraffic.com/metdataflights.jpg
-
-
+https://rtwa.flyrealtraffic.com/BDS6_Global.jpg
 
 viewadsb also lets you set the ownship interactively, either by entering the callsign or the hex id.
 
