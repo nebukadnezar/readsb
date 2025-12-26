@@ -367,7 +367,11 @@ Also, if your laptop is connected to inflight internet, you'll be feeding your p
 ## viewadsb
 viewadsb has some enhanced features now and displays range and bearing to traffic based on the position you're giving it, or based on the ownship position. It also displays the number of targets being decoded, as well as the current receiver gain setting. This can help in optimising the gain setting you pass to readsb.
 
-viewadsb also displays the (almost) full complement of information received via ADS-B, to include NIC, NACp, transmitter category, and in places where enhanced interrogation is active, IAS, TAS, Mach, OAT, track rate, roll, and autopilot selected intent. You can check where in the world these enhanced interrogation modes are active in these two maps:
+viewadsb also displays the (almost) full complement of information received via ADS-B, to include NIC, NACp, transmitter category, and in places where enhanced interrogation is active, IAS, TAS, Mach, OAT, track rate, roll, and autopilot selected intent.
+
+![viewadsb screenshot](viewadsb.jpg)
+
+You can check where in the world these enhanced interrogation modes are active in these two maps:
 
 BDS 4,0 — Selected Vertical Intention
 - MCP/FCU selected altitude
