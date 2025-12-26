@@ -26,10 +26,16 @@ For macOS build and info, check the [macOS](##macos) section
 ## Credits / history
 
 antirez (original dump1090)
+
 Malcom Robb (work on his dump1090 fork)
+
 mutability (forked to dump1090-mutability and further to dump1090-fa)
+
 Mictronics (readsb as a fork of dump1090-fa)
+
 wiedehopf (this fork of Mictronics readsb)
+
+Balthasar Indermuehle (GDL90/EFB functionality, enhanced viewadsb)
 
 ### aircraft.json format:
 
