@@ -384,10 +384,10 @@ BDS 4,0 — Selected Vertical Intention
 - Approach mode engaged (status)
 - Target altitude source
 
-https://rtwa.flyrealtraffic.com/BDS4_Global.jpg
-https://rtwa.flyrealtraffic.com/BDS4_NorthAmerica.jpg
-https://rtwa.flyrealtraffic.com/BDS4_AUNZ.jpg
-https://rtwa.flyrealtraffic.com/BDS4_Europe.jpg
+[Global BDS4 coverage](https://rtwa.flyrealtraffic.com/BDS4_Global.jpg)
+[USA BDS4 coverage](https://rtwa.flyrealtraffic.com/BDS4_NorthAmerica.jpg)
+[Australia / New Zealand BDS4 coverage](https://rtwa.flyrealtraffic.com/BDS4_AUNZ.jpg)
+[Europe BDS4 coverage](https://rtwa.flyrealtraffic.com/BDS4_Europe.jpg)
 
 
 BDS 5,0 — Track and Turn Report
@@ -397,10 +397,10 @@ BDS 5,0 — Track and Turn Report
 - Track angle rate (turn rate)
 - True airspeed (TAS)
 
-https://rtwa.flyrealtraffic.com/BDS5_Global.jpg
-https://rtwa.flyrealtraffic.com/BDS5_NorthAmerica.jpg
-https://rtwa.flyrealtraffic.com/BDS5_AUNZ.jpg
-https://rtwa.flyrealtraffic.com/BDS5_Europe.jpg
+[Global BDS5 coverage](https://rtwa.flyrealtraffic.com/BDS5_Global.jpg)
+[USA BDS5 coverage](https://rtwa.flyrealtraffic.com/BDS5_NorthAmerica.jpg)
+[Australia / New Zealand BDS5 coverage](https://rtwa.flyrealtraffic.com/BDS5_AUNZ.jpg)
+[Europe BDS5 coverage](https://rtwa.flyrealtraffic.com/BDS5_Europe.jpg)
 
 BDS 6,0 — Heading and Speed Report
 - Magnetic heading
@@ -409,10 +409,10 @@ BDS 6,0 — Heading and Speed Report
 - Barometric altitude rate (vertical rate from barometric source)
 - Inertial vertical velocity (vertical rate from INS/IRS)
 
-https://rtwa.flyrealtraffic.com/BDS6_Global.jpg
-https://rtwa.flyrealtraffic.com/BDS6_NorthAmerica.jpg
-https://rtwa.flyrealtraffic.com/BDS6_AUNZ.jpg
-https://rtwa.flyrealtraffic.com/BDS6_Europe.jpg
+[Global BDS6 coverage](https://rtwa.flyrealtraffic.com/BDS6_Global.jpg)
+[USA BDS6 coverage](https://rtwa.flyrealtraffic.com/BDS6_NorthAmerica.jpg)
+[Australia / New Zealand BDS6 coverage](https://rtwa.flyrealtraffic.com/BDS6_AUNZ.jpg)
+[Europe BDS6 coverage](https://rtwa.flyrealtraffic.com/BDS6_Europe.jpg)
 
 ## readsb --help
 
