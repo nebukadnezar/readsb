@@ -369,6 +369,35 @@ viewadsb has some enhanced features now and displays range and bearing to traffi
 
 viewadsb also displays the (almost) full complement of information received via ADS-B, to include NIC, NACp, transmitter category, and in places where enhanced interrogation is active, IAS, TAS, Mach, OAT, track rate, roll, and autopilot selected intent. You can check where in the world these enhanced interrogation modes are active in these two maps:
 
+BDS 4,0 — Selected Vertical Intention
+- MCP/FCU selected altitude
+- FMS selected altitude
+- Barometric pressure setting (QNH/QFE)
+- VNAV mode engaged (status)
+- Altitude hold mode engaged (status)
+- Approach mode engaged (status)
+- Target altitude source
+
+BDS 5,0 — Track and Turn Report
+- Roll angle
+- True track angle
+- Ground speed
+- Track angle rate (turn rate)
+- True airspeed (TAS)
+
+BDS 4,0 and 5,0 messages are available here: https://rtwa.flyrealtraffic.com/Param_Global.jpg
+
+BDS 6,0 — Heading and Speed Report
+- Magnetic heading
+- Indicated airspeed (IAS)
+- Mach number
+- Barometric altitude rate (vertical rate from barometric source)
+- Inertial vertical velocity (vertical rate from INS/IRS)
+
+BDS 6,0 messages are available here: https://rtwa.flyrealtraffic.com/metdataflights.jpg
+
+
+
 viewadsb also lets you set the ownship interactively, either by entering the callsign or the hex id.
 
 ## readsb --help
