@@ -365,13 +365,15 @@ Once up and running and you can see your own aircraft in viewadsb, set the ownsh
 Also, if your laptop is connected to inflight internet, you'll be feeding your position into the flyrealtraffic.com system, making many a simulator pilot very happy! Omit the --net-connector feed.flyrealtaffic.com... option in the command if you don't want to do that.
 
 ## viewadsb
-viewadsb has some enhanced features now and displays range and bearing to traffic based on the position you're giving it, or based on the ownship position. It also displays the number of targets being decoded, as well as the current receiver gain setting. This can help in optimising the gain setting you pass to readsb.
+viewadsb has some enhanced features now and displays range and bearing to traffic based on the position you're giving it on startup, or based on the ownship position. It also displays the number of targets being decoded, as well as the current receiver gain setting. This can help in optimising the gain setting you pass to readsb.
+
+viewadsb also lets you set the ownship interactively, either by entering the callsign or the hex id. Press 'o' to set the ownship (case insensitive), 's' to select which parameter to sort by, and 'q' to reverse the sort order.
 
 viewadsb also displays the (almost) full complement of information received via ADS-B, to include NIC, NACp, transmitter category, and in places where enhanced interrogation is active, IAS, TAS, Mach, OAT, track rate, roll, and autopilot selected intent.
 
 ![viewadsb screenshot](viewadsb.jpg)
 
-You can check where in the world these enhanced interrogation modes are active in these maps:
+The content of ADS-B messages depends on the ground radar EHS mode (enhanced interrogation). You can check where in the world these enhanced interrogation modes are active in these maps:
 
 BDS 4,0 — Selected Vertical Intention
 - MCP/FCU selected altitude
@@ -383,6 +385,10 @@ BDS 4,0 — Selected Vertical Intention
 - Target altitude source
 
 https://rtwa.flyrealtraffic.com/BDS4_Global.jpg
+https://rtwa.flyrealtraffic.com/BDS4_NorthAmerica.jpg
+https://rtwa.flyrealtraffic.com/BDS4_AUNZ.jpg
+https://rtwa.flyrealtraffic.com/BDS4_Europe.jpg
+
 
 BDS 5,0 — Track and Turn Report
 - Roll angle
@@ -392,6 +398,9 @@ BDS 5,0 — Track and Turn Report
 - True airspeed (TAS)
 
 https://rtwa.flyrealtraffic.com/BDS5_Global.jpg
+https://rtwa.flyrealtraffic.com/BDS5_NorthAmerica.jpg
+https://rtwa.flyrealtraffic.com/BDS5_AUNZ.jpg
+https://rtwa.flyrealtraffic.com/BDS5_Europe.jpg
 
 BDS 6,0 — Heading and Speed Report
 - Magnetic heading
@@ -401,8 +410,9 @@ BDS 6,0 — Heading and Speed Report
 - Inertial vertical velocity (vertical rate from INS/IRS)
 
 https://rtwa.flyrealtraffic.com/BDS6_Global.jpg
-
-viewadsb also lets you set the ownship interactively, either by entering the callsign or the hex id.
+https://rtwa.flyrealtraffic.com/BDS6_NorthAmerica.jpg
+https://rtwa.flyrealtraffic.com/BDS6_AUNZ.jpg
+https://rtwa.flyrealtraffic.com/BDS6_Europe.jpg
 
 ## readsb --help
 
