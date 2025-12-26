@@ -348,19 +348,19 @@ This build allows forwarding of the traffic data to electronic flight bag (EFB) 
 
 You can pass the ```--gdl90``` option to enable automatic EFB discovery of any GDL90 compatible EFBs (e.g. Foreflight) in your LAN, or you can set the EFB's IP address explicitly by passing ```--gdl90-ip 1.2.3.4``` where 1.2.3.4 obviously is the actual IP address of your EFB.
 
-EFBs that support XGPS and XTRAFFIC messages (e.g. Garmin Pilot) are supported by setting the ownship and EFB IP address, as well as telling readsb what to send. For example, passing ```--ownship 7c45ab --sendxgps --sendxtraffic --efb-ip 1.2.3.4``` will send XGPS and XTRAFFIC messages to 1.2.3.4 on the default port 49002 and sets the ownship to the aircraft with the hex id 7c45ab. To only set traffic without setting the ownship, omit the --ownship and --sendxgps command line parameters.
+EFBs that support XGPS and XTRAFFIC messages (e.g. Garmin Pilot) are supported by setting the ownship and EFB IP address, as well as telling readsb what to send. For example, passing ```--ownship 7c45ab --sendxgps --sendxtraffic --efb-ip 1.2.3.4``` will send XGPS and XTRAFFIC messages to 1.2.3.4 on the default port 49002 and sets the ownship to the aircraft with the hex id 7c45ab. To only send traffic without setting the ownship, omit the --ownship and --sendxgps command line parameters.
 
-If you're running this in your own airplane (or as a passenger in an airliner), simply run readsb in a screen, then run viewadsb. This is a great solution in aircraft like the 787 where GPS devices inside the cabin won't work due to the electronic window dimming that creates a faraday cage too good for GNSS signals, but the transponder signal of the aircraft still makes it into the cabin. Simply start readsb in one terminal:
+If you're running this in your own airplane (or as a passenger in an airliner), simply run readsb in a screen or separate terminal, then run viewadsb in another screen or another terminal. This is a great solution in aircraft like the 787 where GPS devices inside the cabin won't work due to the electronic window dimming that creates a faraday cage too good for GNSS signals, but the transponder signal of the aircraft still makes it into the cabin. Simply start readsb in one terminal or screen:
 
 ``` ./readsb --device-type rtlsdr --gain auto --ppm 0 --net --net-heartbeat 60 --net-ro-size 1250 --net-ro-interval 0.05 --net-ri-port 30001 --net-ro-port 30002 --net-sbs-port 30003 --net-bi-port 30004,30104 --net-bo-port 30005 --net-connector feed.flyrealtraffic.com,30004,beast_reduce_plus_out,uuid=7eff6a72-f1ad-11ef-b4bc-d7b975414c18 --dump-beast=/tmp/beast.dump,60 --quiet --gdl90```
 
-and in another terminal run viewadsb:
+and in another terminal or screen run viewadsb:
 
 ```./viewadsb```
 
-And once up and running and you can see your own aircraft in viewadsb, set the ownship to your flight and that will be sent to Foreflight as the ownship, giving you full visibility of where in the world you are (and independent of your inflight entertainment screen).
+Once up and running and you can see your own aircraft in viewadsb, set the ownship in viewadsb to your flight (press 'o' and enter your callsign or hex id), and that will be sent to readsb to set the ownship, which in turn sends this to Foreflight as the ownship, giving you full visibility of where in the world you are (and independent of your inflight entertainment screen).
 
-Also, if your laptop is connected to the inflight internet, you'll be feeding your position into the flyrealtraffic.com system, making many a simulator pilot very happy!
+Also, if your laptop is connected to inflight internet, you'll be feeding your position into the flyrealtraffic.com system, making many a simulator pilot very happy! Omit the --net-connector feed.flyrealtaffic.com... option in the command if you don't want to do that.
 
 ## viewadsb
 viewadsb has some enhanced features now and displays range and bearing to traffic based on the position you're giving it, or based on the ownship position. It also displays the number of targets being decoded, as well as the current receiver gain setting. This can help in optimising the gain setting you pass to readsb.
