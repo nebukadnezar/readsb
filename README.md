@@ -381,6 +381,7 @@ BDS 4,0 — Selected Vertical Intention
 - Altitude hold mode engaged (status)
 - Approach mode engaged (status)
 - Target altitude source
+
 https://rtwa.flyrealtraffic.com/BDS4_Global.jpg
 
 BDS 5,0 — Track and Turn Report
@@ -389,6 +390,7 @@ BDS 5,0 — Track and Turn Report
 - Ground speed
 - Track angle rate (turn rate)
 - True airspeed (TAS)
+
 https://rtwa.flyrealtraffic.com/BDS5_Global.jpg
 
 BDS 6,0 — Heading and Speed Report
@@ -397,6 +399,7 @@ BDS 6,0 — Heading and Speed Report
 - Mach number
 - Barometric altitude rate (vertical rate from barometric source)
 - Inertial vertical velocity (vertical rate from INS/IRS)
+
 https://rtwa.flyrealtraffic.com/BDS6_Global.jpg
 
 viewadsb also lets you set the ownship interactively, either by entering the callsign or the hex id.
