@@ -815,6 +815,16 @@ void interactiveShowData(void) {
             } else {
                 printw("No receiver position set (use --lat/--lon or set ownship)");
             }
+            
+            // Show EFB update rates if connected
+            if (Modes.received_efb_ownship_rate > 0 || Modes.received_efb_traffic_rate > 0) {
+                printw("  ");
+                if (has_colors()) attron(COLOR_PAIR(2));
+                printw("EFB: Own:%.1fHz Tfc:%.1fHz", 
+                       Modes.received_efb_ownship_rate, 
+                       Modes.received_efb_traffic_rate);
+                if (has_colors()) attroff(COLOR_PAIR(2));
+            }
         }
         
         // print header with colors matching data columns

@@ -1385,6 +1385,13 @@ static void backgroundTasks(int64_t now) {
         broadcastGain();
     }
 
+    // Broadcast EFB rates every second (for display in viewadsb)
+    static int64_t next_efb_broadcast;
+    if (now > next_efb_broadcast) {
+        next_efb_broadcast = now + 1 * SECONDS;
+        broadcastEfbRates();
+    }
+
     // Refresh screen when in interactive mode
     static int64_t next_interactive;
     if (Modes.interactive && now > next_interactive) {

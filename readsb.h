@@ -592,6 +592,8 @@ struct _Modes
     int minGain;
     int gain;
     int received_gain;  // Gain received from readsb (for viewadsb)
+    float received_efb_ownship_rate;  // EFB ownship update rate received from readsb (for viewadsb)
+    float received_efb_traffic_rate;  // EFB traffic update rate received from readsb (for viewadsb)
     int dc_filter; // should we apply a DC filter?
     int enable_agc;
     sdr_type_t sdr_type; // where are we getting data from?
@@ -981,7 +983,8 @@ struct _Modes
     int send_xgps;                  // Send XGPS messages for ownship
     int send_xtraffic;              // Send XTRAFFIC messages for traffic
     int efb_fd;                     // UDP socket for XGPS/XTRAFFIC
-    int64_t efb_next_update;        // Next time to send EFB data
+    int64_t efb_next_update;        // Next time to send EFB traffic data (1Hz)
+    int64_t efb_ownship_next_update; // Next time to send EFB ownship data (5Hz)
 
     // GDL90 output configuration
     int gdl90_enabled;              // Whether GDL90 output is enabled
@@ -992,8 +995,15 @@ struct _Modes
     struct sockaddr_in gdl90_target_addr;  // Target address discovered from EFB announcement
     int gdl90_target_valid;         // Whether we have a valid target address
     int64_t gdl90_target_timeout;   // When the target address expires
-    int64_t gdl90_next_update;      // Next time to send GDL90 data (1Hz)
-    int64_t gdl90_ahrs_next_update; // Next time to send AHRS data (5Hz)
+    int64_t gdl90_next_update;      // Next time to send GDL90 traffic data (1Hz)
+    int64_t gdl90_ownship_next_update; // Next time to send GDL90 ownship data (5Hz)
+
+    // EFB rate tracking (for display in viewadsb)
+    int efb_ownship_count;          // Ownship messages sent in current period
+    int efb_traffic_count;          // Traffic messages sent in current period
+    int64_t efb_rate_period_start;  // Start of current rate tracking period
+    float efb_ownship_rate;         // Ownship update rate in Hz
+    float efb_traffic_rate;         // Traffic update rate in Hz
 };
 
 extern struct _Modes Modes;

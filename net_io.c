@@ -3834,6 +3834,57 @@ void broadcastGain(void) {
     completeWrite(&Modes.beast_out, p);
 }
 
+// Broadcast EFB rates to all beast output clients
+// Called periodically when EFB is connected
+void broadcastEfbRates(void) {
+    int64_t mono = mono_milli_seconds();
+    
+    // Update rate tracking every second
+    if (Modes.efb_rate_period_start == 0) {
+        Modes.efb_rate_period_start = mono;
+    }
+    if (mono >= Modes.efb_rate_period_start + 1000) {
+        int64_t elapsed = mono - Modes.efb_rate_period_start;
+        if (elapsed > 0) {
+            Modes.efb_ownship_rate = Modes.efb_ownship_count * 1000.0f / elapsed;
+            Modes.efb_traffic_rate = Modes.efb_traffic_count * 1000.0f / elapsed;
+        }
+        Modes.efb_ownship_count = 0;
+        Modes.efb_traffic_count = 0;
+        Modes.efb_rate_period_start = mono;
+    }
+
+    if (!Modes.beast_out.connections) {
+        return;
+    }
+
+    // Only broadcast if we have an EFB connection
+    int efb_connected = (Modes.gdl90_target_valid || 
+                        (Modes.efb_fd >= 0 && (Modes.send_xgps || Modes.send_xtraffic)));
+    if (!efb_connected && Modes.efb_ownship_rate == 0 && Modes.efb_traffic_rate == 0) {
+        return;
+    }
+    
+    // Format: 0x1a + E + 2 bytes ownship rate (fixed point, tenths of Hz) + 2 bytes traffic rate
+    char *p = prepareWrite(&Modes.beast_out, 6);
+    if (!p) {
+        return;
+    }
+    
+    // Convert rates to tenths of Hz (e.g., 5.0 Hz -> 50)
+    int16_t ownship_rate = (int16_t)(Modes.efb_ownship_rate * 10);
+    int16_t traffic_rate = (int16_t)(Modes.efb_traffic_rate * 10);
+    
+    *p++ = 0x1a;
+    *p++ = 'E';
+    *p++ = (ownship_rate >> 8) & 0xFF;
+    *p++ = ownship_rate & 0xFF;
+    *p++ = (traffic_rate >> 8) & 0xFF;
+    *p++ = traffic_rate & 0xFF;
+    
+    completeWrite(&Modes.beast_out, p);
+}
+
 static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struct messageBuffer *mb) {
     MODES_NOTUSED(c);
     MODES_NOTUSED(remote);
@@ -5402,6 +5453,20 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             Modes.received_gain = gain;
             c->som += 4;  // 0x1a + G + 2 bytes
             continue;
+        } else if (ch == 'E') {
+            // EFB rates command from readsb server
+            // Format: 0x1a + E + 2 bytes ownship rate + 2 bytes traffic rate (tenths of Hz)
+            p++;
+            if (p + 4 > c->eod) {
+                // Incomplete, wait for more data
+                break;
+            }
+            int16_t ownship_rate = ((uint8_t)p[0] << 8) | (uint8_t)p[1];
+            int16_t traffic_rate = ((uint8_t)p[2] << 8) | (uint8_t)p[3];
+            Modes.received_efb_ownship_rate = ownship_rate / 10.0f;
+            Modes.received_efb_traffic_rate = traffic_rate / 10.0f;
+            c->som += 6;  // 0x1a + E + 4 bytes
+            continue;
         } else {
             // Not a valid beast message, skip 0x1a
             // Skip following byte as well:
@@ -6754,19 +6819,30 @@ void efbPeriodicWork(void) {
         return;
 
     int64_t mono = mono_milli_seconds();
-    if (mono < Modes.efb_next_update)
-        return;
-
-    // Send updates at 1Hz as per ForeFlight spec
-    Modes.efb_next_update = mono + 1000;
-
     int64_t now = mstime();  // Use mstime() for aircraft timestamp comparisons
 
     // Constants for unit conversion
-    // Altitude: meters to feet (for XTRAFFIC)
-    // Speed: meters/sec (XGPS) vs knots (XTRAFFIC)
     const double FEET_PER_METER = 3.28084;
     const double KNOTS_TO_MPS = 0.514444;
+
+    // Send ownship at 5Hz (every 200ms)
+    int send_ownship = (mono >= Modes.efb_ownship_next_update);
+    if (send_ownship) {
+        Modes.efb_ownship_next_update = mono + 200;
+    }
+
+    // Send traffic at 1Hz (every 1000ms)
+    int send_traffic = (mono >= Modes.efb_next_update);
+    if (send_traffic) {
+        Modes.efb_next_update = mono + 1000;
+        Modes.efb_traffic_count++;
+    }
+
+    // Nothing to send this cycle
+    if (!send_ownship && !send_traffic)
+        return;
+
+    int ownship_sent = 0;
 
     // Iterate through all aircraft
     // Use aircraftActive for synthetic mode (hash buckets not populated)
@@ -6790,7 +6866,16 @@ void efbPeriodicWork(void) {
             if (!trackDataValid(&a->position_valid))
                 continue;
 
-            efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+            if (isOwnship(a)) {
+                if (send_ownship) {
+                    efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+                    ownship_sent = 1;
+                }
+            } else {
+                if (send_traffic) {
+                    efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+                }
+            }
         }
         ca_unlock_read(ca);
     } else {
@@ -6808,9 +6893,22 @@ void efbPeriodicWork(void) {
                 if (!trackDataValid(&a->position_valid))
                     continue;
 
-                efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+                if (isOwnship(a)) {
+                    if (send_ownship) {
+                        efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+                        ownship_sent = 1;
+                    }
+                } else {
+                    if (send_traffic) {
+                        efbSendAircraft(a, FEET_PER_METER, KNOTS_TO_MPS);
+                    }
+                }
             }
         }
+    }
+
+    if (ownship_sent) {
+        Modes.efb_ownship_count++;
     }
 }
 
@@ -7491,7 +7589,7 @@ void gdl90Init(void) {
     }
 
     Modes.gdl90_next_update = mono_milli_seconds();
-    Modes.gdl90_ahrs_next_update = mono_milli_seconds();
+    Modes.gdl90_ownship_next_update = mono_milli_seconds();
 }
 
 void gdl90Close(void) {
@@ -7532,7 +7630,29 @@ void gdl90PeriodicWork(void) {
     uint8_t msg[64];
     int msg_len;
 
-    // Find ownship aircraft (needed for both AHRS and other messages)
+    // Determine what to send this cycle
+    int send_ownship = (mono >= Modes.gdl90_ownship_next_update);
+    if (send_ownship) {
+        Modes.gdl90_ownship_next_update = mono + 200;  // 5Hz
+    }
+
+    int send_traffic = (mono >= Modes.gdl90_next_update);
+    if (send_traffic) {
+        Modes.gdl90_next_update = mono + 1000;  // 1Hz
+        Modes.efb_traffic_count++;
+
+        // Send Heartbeat at 1Hz
+        msg_len = gdl90BuildHeartbeat(msg, sizeof(msg));
+        if (msg_len > 0) {
+            gdl90Send(msg, msg_len);
+        }
+    }
+
+    // Nothing to send this cycle
+    if (!send_ownship && !send_traffic)
+        return;
+
+    // Find ownship aircraft (needed for ownship messages)
     struct aircraft *ownship = NULL;
     if (hasOwnshipConfig()) {
         if (Modes.synthetic_now) {
@@ -7556,39 +7676,40 @@ void gdl90PeriodicWork(void) {
         }
     }
 
-    // Send AHRS at 5Hz (every 200ms) - for ownship only
-    if (mono >= Modes.gdl90_ahrs_next_update) {
-        Modes.gdl90_ahrs_next_update = mono + 200;
-
-        if (ownship) {
-            msg_len = gdl90BuildAHRS(msg, sizeof(msg), ownship);
-            if (msg_len > 0) {
-                gdl90Send(msg, msg_len);
-            }
+    // Send ownship messages at 5Hz
+    if (send_ownship && ownship) {
+        // Send AHRS
+        msg_len = gdl90BuildAHRS(msg, sizeof(msg), ownship);
+        if (msg_len > 0) {
+            gdl90Send(msg, msg_len);
         }
+
+        // Send Ownship Report
+        msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), ownship, 1);
+        if (msg_len > 0) {
+            gdl90Send(msg, msg_len);
+        }
+
+        // Send Ownship Geometric Altitude
+        msg_len = gdl90BuildOwnshipAlt(msg, sizeof(msg), ownship);
+        if (msg_len > 0) {
+            gdl90Send(msg, msg_len);
+        }
+
+        // Send ForeFlight ID message at 5Hz too (contains ownship info)
+        msg_len = gdl90BuildForeFlightId(msg, sizeof(msg), ownship);
+        if (msg_len > 0) {
+            gdl90Send(msg, msg_len);
+        }
+
+        Modes.efb_ownship_count++;
     }
 
-    // Send other messages at 1Hz (use monotonic time for rate limiting)
-    if (mono < Modes.gdl90_next_update)
+    // Send traffic at 1Hz
+    if (!send_traffic)
         return;
 
-    Modes.gdl90_next_update = mono + 1000;
-
-    // Send Heartbeat
-    msg_len = gdl90BuildHeartbeat(msg, sizeof(msg));
-    if (msg_len > 0) {
-        gdl90Send(msg, msg_len);
-    }
-
-    // Send ForeFlight ID message (with ownship callsign if available)
-    msg_len = gdl90BuildForeFlightId(msg, sizeof(msg), ownship);
-    if (msg_len > 0) {
-        gdl90Send(msg, msg_len);
-    }
-
-    // Iterate through all aircraft
-    // Use aircraftActive for synthetic mode (hash buckets not populated)
-    // Use hash buckets for normal mode (lock-free, better performance)
+    // Iterate through all aircraft for traffic
     if (Modes.synthetic_now) {
         struct craftArray *ca = &Modes.aircraftActive;
         ca_lock_read(ca);
@@ -7608,25 +7729,14 @@ void gdl90PeriodicWork(void) {
             if (!trackDataValid(&a->position_valid))
                 continue;
 
-            // Check if this is the ownship
-            if (isOwnship(a)) {
-                // Send Ownship Report
-                msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 1);
-                if (msg_len > 0) {
-                    gdl90Send(msg, msg_len);
-                }
+            // Skip ownship (already sent at 5Hz)
+            if (isOwnship(a))
+                continue;
 
-                // Send Ownship Geometric Altitude
-                msg_len = gdl90BuildOwnshipAlt(msg, sizeof(msg), a);
-                if (msg_len > 0) {
-                    gdl90Send(msg, msg_len);
-                }
-            } else {
-                // Send Traffic Report
-                msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
-                if (msg_len > 0) {
-                    gdl90Send(msg, msg_len);
-                }
+            // Send Traffic Report
+            msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
+            if (msg_len > 0) {
+                gdl90Send(msg, msg_len);
             }
         }
         ca_unlock_read(ca);
@@ -7645,25 +7755,14 @@ void gdl90PeriodicWork(void) {
                 if (!trackDataValid(&a->position_valid))
                     continue;
 
-                // Check if this is the ownship
-                if (isOwnship(a)) {
-                    // Send Ownship Report
-                    msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 1);
-                    if (msg_len > 0) {
-                        gdl90Send(msg, msg_len);
-                    }
+                // Skip ownship (already sent at 5Hz)
+                if (isOwnship(a))
+                    continue;
 
-                    // Send Ownship Geometric Altitude
-                    msg_len = gdl90BuildOwnshipAlt(msg, sizeof(msg), a);
-                    if (msg_len > 0) {
-                        gdl90Send(msg, msg_len);
-                    }
-                } else {
-                    // Send Traffic Report
-                    msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
-                    if (msg_len > 0) {
-                        gdl90Send(msg, msg_len);
-                    }
+                // Send Traffic Report
+                msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
+                if (msg_len > 0) {
+                    gdl90Send(msg, msg_len);
                 }
             }
         }
