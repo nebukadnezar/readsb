@@ -102,6 +102,7 @@ extern double bearing(double lat0, double lon0, double lat1, double lon1);
 static char ownship_input[16];      // Buffer for ownship input
 static int ownship_input_len = 0;   // Current input length
 static int ownship_input_active = 0; // 1 if currently entering ownship
+static int ownship_initialized = 0;  // 1 after first ownship setup from command line
 
 // Local ownship tracking for viewadsb
 static uint32_t viewadsb_ownship_hex = 0;
@@ -210,6 +211,9 @@ static double calculate3DDistance(double ref_lat, double ref_lon, double ref_alt
 
 // Set ownship from input string (hex or callsign)
 static void setOwnshipFromInput(const char *input) {
+    // Mark as initialized - user is now in control
+    ownship_initialized = 1;
+    
     if (!input || input[0] == '\0') {
         // Clear ownship - the periodic function will send the clear command
         viewadsb_ownship_hex = 0;
@@ -271,13 +275,16 @@ void interactiveSendOwnship(void) {
         last_sent_callsign[0] = '\0';
     }
 
-    // Check if ownship was set from command line (first-time setup)
-    if (viewadsb_ownship_hex == 0 && viewadsb_ownship_callsign[0] == '\0') {
+    // Check if ownship was set from command line (first-time setup only)
+    // Once initialized, user controls ownship via interactive input
+    if (!ownship_initialized) {
         if (Modes.ownship_hex != 0) {
             viewadsb_ownship_hex = Modes.ownship_hex;
+            ownship_initialized = 1;
         } else if (Modes.ownship_callsign[0] != '\0') {
             strncpy(viewadsb_ownship_callsign, Modes.ownship_callsign, 8);
             viewadsb_ownship_callsign[8] = '\0';
+            ownship_initialized = 1;
         }
     }
 

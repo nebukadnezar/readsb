@@ -400,6 +400,12 @@ static struct client *createSocketClient(struct net_service *service, int fd, ch
     if (epoll_ctl(Modes.net_epfd, EPOLL_CTL_ADD, c->fd, &c->epollEvent))
         perror("epoll_ctl fail:");
 
+    // Send current ownship config to newly connected beast_out clients
+    if (service->writer == &Modes.beast_out) {
+        broadcastOwnshipConfig();
+        broadcastGain();
+    }
+
     return c;
 }
 
@@ -3820,8 +3826,15 @@ void broadcastGain(void) {
         return;
     }
     
+    // Don't broadcast invalid gain values (e.g., in net-only mode)
+    // MODES_MAX_GAIN and MODES_AUTO_GAIN are sentinel values, not real gains
+    if (Modes.gain == MODES_MAX_GAIN || Modes.gain == MODES_AUTO_GAIN || Modes.gain == 0) {
+        return;
+    }
+    
     // Format: 0x1a + G + 2 bytes (int16_t big-endian)
-    char *p = prepareWrite(&Modes.beast_out, 4);
+    // Need up to 6 bytes if both data bytes need escaping (0x1a G d1 [d1] d2 [d2])
+    char *p = prepareWrite(&Modes.beast_out, 6);
     if (!p) {
         return;
     }
@@ -3829,7 +3842,11 @@ void broadcastGain(void) {
     *p++ = 0x1a;
     *p++ = 'G';
     *p++ = (Modes.gain >> 8) & 0xFF;  // High byte
+    if (*(p-1) == 0x1a)
+        *p++ = 0x1a;
     *p++ = Modes.gain & 0xFF;          // Low byte
+    if (*(p-1) == 0x1a)
+        *p++ = 0x1a;
     
     completeWrite(&Modes.beast_out, p);
 }
@@ -3852,6 +3869,17 @@ void broadcastEfbRates(void) {
         Modes.efb_ownship_count = 0;
         Modes.efb_traffic_count = 0;
         Modes.efb_rate_period_start = mono;
+        
+        // Log rates to GDL90 log if enabled
+        if (Modes.gdl90_log_file) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm *tm = gmtime(&ts.tv_sec);
+            fprintf(Modes.gdl90_log_file, "%04d-%02d-%02d %02d:%02d:%02d.%03ld [EFB_RATES] ownship=%.1fHz traffic=%.1fHz\n",
+                    tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                    tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
+                    Modes.efb_ownship_rate, Modes.efb_traffic_rate);
+        }
     }
 
     if (!Modes.beast_out.connections) {
@@ -3866,7 +3894,8 @@ void broadcastEfbRates(void) {
     }
     
     // Format: 0x1a + E + 2 bytes ownship rate (fixed point, tenths of Hz) + 2 bytes traffic rate
-    char *p = prepareWrite(&Modes.beast_out, 6);
+    // Need up to 10 bytes if all 4 data bytes need escaping
+    char *p = prepareWrite(&Modes.beast_out, 10);
     if (!p) {
         return;
     }
@@ -3878,11 +3907,74 @@ void broadcastEfbRates(void) {
     *p++ = 0x1a;
     *p++ = 'E';
     *p++ = (ownship_rate >> 8) & 0xFF;
+    if (*(p-1) == 0x1a)
+        *p++ = 0x1a;
     *p++ = ownship_rate & 0xFF;
+    if (*(p-1) == 0x1a)
+        *p++ = 0x1a;
     *p++ = (traffic_rate >> 8) & 0xFF;
+    if (*(p-1) == 0x1a)
+        *p++ = 0x1a;
     *p++ = traffic_rate & 0xFF;
+    if (*(p-1) == 0x1a)
+        *p++ = 0x1a;
     
     completeWrite(&Modes.beast_out, p);
+}
+
+// Broadcast current ownship configuration to all beast output clients
+// Called when ownship changes or when a new client connects
+void broadcastOwnshipConfig(void) {
+    if (!Modes.beast_out.connections) {
+        return;
+    }
+    
+    // Check if we have an ownship configured
+    if (!Modes.ownship_hex && !Modes.ownship_callsign[0]) {
+        return;  // No ownship configured
+    }
+    
+    if (Modes.ownship_hex) {
+        // Send hex format: 0x1a + O + H + 6 hex chars
+        char *p = prepareWrite(&Modes.beast_out, 9);
+        if (!p) {
+            return;
+        }
+        
+        *p++ = 0x1a;
+        *p++ = 'O';
+        *p++ = 'H';
+        
+        // Convert hex to string
+        char hexstr[7];
+        snprintf(hexstr, sizeof(hexstr), "%06X", Modes.ownship_hex);
+        for (int i = 0; i < 6; i++) {
+            *p++ = hexstr[i];
+        }
+        
+        completeWrite(&Modes.beast_out, p);
+    } else if (Modes.ownship_callsign[0]) {
+        // Send callsign format: 0x1a + O + C + 8 callsign chars
+        char *p = prepareWrite(&Modes.beast_out, 11);
+        if (!p) {
+            return;
+        }
+        
+        *p++ = 0x1a;
+        *p++ = 'O';
+        *p++ = 'C';
+        
+        // Copy callsign, pad with spaces
+        for (int i = 0; i < 8; i++) {
+            if (Modes.ownship_callsign[i]) {
+                *p++ = Modes.ownship_callsign[i];
+            } else {
+                *p++ = ' ';
+            }
+        }
+        
+        completeWrite(&Modes.beast_out, p);
+    }
 }
 
 static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struct messageBuffer *mb) {
@@ -4070,6 +4162,7 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                         Modes.ownship_hex = (uint32_t)strtol(hexstr, NULL, 16);
                         Modes.ownship_callsign[0] = '\0';
                         fprintf(stderr, "Ownship set by client to hex: %06X\n", Modes.ownship_hex);
+                        broadcastOwnshipConfig();  // Notify other clients
                     }
                 }
                 break;
@@ -4091,6 +4184,7 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                         strncpy(Modes.ownship_callsign, callsign, 8);
                         Modes.ownship_callsign[8] = '\0';
                         fprintf(stderr, "Ownship set by client to callsign: %s\n", Modes.ownship_callsign);
+                        broadcastOwnshipConfig();  // Notify other clients
                     }
                 }
                 break;
@@ -4099,13 +4193,34 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                 Modes.ownship_hex = 0;
                 Modes.ownship_callsign[0] = '\0';
                 fprintf(stderr, "Ownship cleared by client\n");
+                broadcastOwnshipConfig();  // Notify other clients (sends nothing since cleared)
                 break;
         }
     } else if (p[0] == 'G') {
         // Gain command from readsb server
         // Format: G + 2 bytes (int16_t big-endian, gain in tenths of dB)
-        int16_t gain = ((uint8_t)p[1] << 8) | (uint8_t)p[2];
+        // Data bytes may be escaped (0x1a -> 0x1a 0x1a)
+        char *q = p + 1;
+        uint8_t b1 = (uint8_t)*q++;
+        if (b1 == 0x1a) q++;  // skip escape
+        uint8_t b2 = (uint8_t)*q++;
+        if (b2 == 0x1a) q++;  // skip escape
+        int16_t gain = (b1 << 8) | b2;
         Modes.received_gain = gain;
+    } else if (p[0] == 'E') {
+        // EFB rates command from readsb server
+        // Format: E + 4 bytes (2x int16_t big-endian, tenths of Hz)
+        // Data bytes may be escaped (0x1a -> 0x1a 0x1a)
+        char *q = p + 1;
+        uint8_t bytes[4];
+        for (int i = 0; i < 4; i++) {
+            bytes[i] = (uint8_t)*q++;
+            if (bytes[i] == 0x1a) q++;  // skip escape
+        }
+        int16_t ownship_rate = (bytes[0] << 8) | bytes[1];
+        int16_t traffic_rate = (bytes[2] << 8) | bytes[3];
+        Modes.received_efb_ownship_rate = ownship_rate / 10.0f;
+        Modes.received_efb_traffic_rate = traffic_rate / 10.0f;
     }
     return 0;
 }
@@ -5009,6 +5124,9 @@ static int readBeastcommand(struct client *c, int64_t now, struct messageBuffer 
         } else if (*p == 'G') { // Gain command from readsb
             // Format: G + 2 bytes (int16_t gain)
             eom = p + 3;
+        } else if (*p == 'E') { // EFB rates command from readsb
+            // Format: E + 4 bytes (2x int16_t rates)
+            eom = p + 5;
         } else {
             // Not a valid beast command, skip 0x1a and try again
             ++c->som;
@@ -5444,29 +5562,108 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
         } else if (ch == 'G') {
             // Gain command from readsb server
             // Format: 0x1a + G + 2 bytes (int16_t big-endian, gain in tenths of dB)
+            // Data bytes may be escaped (0x1a -> 0x1a 0x1a)
             p++;
-            if (p + 2 > c->eod) {
-                // Incomplete, wait for more data
-                break;
+            
+            // Read first byte, handling escape
+            if (p >= c->eod) break;
+            uint8_t b1 = (uint8_t)*p++;
+            if (b1 == 0x1a) {
+                if (p >= c->eod) break;
+                p++;  // skip escape
             }
-            int16_t gain = ((uint8_t)p[0] << 8) | (uint8_t)p[1];
+            
+            // Read second byte, handling escape
+            if (p >= c->eod) break;
+            uint8_t b2 = (uint8_t)*p++;
+            if (b2 == 0x1a) {
+                if (p >= c->eod) break;
+                p++;  // skip escape
+            }
+            
+            int16_t gain = (b1 << 8) | b2;
             Modes.received_gain = gain;
-            c->som += 4;  // 0x1a + G + 2 bytes
+            c->som = p;
             continue;
         } else if (ch == 'E') {
             // EFB rates command from readsb server
-            // Format: 0x1a + E + 2 bytes ownship rate + 2 bytes traffic rate (tenths of Hz)
+            // Format: 0x1a + E + 4 bytes (2x int16_t, tenths of Hz)
+            // Data bytes may be escaped (0x1a -> 0x1a 0x1a)
             p++;
-            if (p + 4 > c->eod) {
-                // Incomplete, wait for more data
-                break;
+            
+            // Read 4 bytes with escape handling
+            uint8_t bytes[4];
+            int complete = 1;
+            for (int i = 0; i < 4 && complete; i++) {
+                if (p >= c->eod) { complete = 0; break; }
+                bytes[i] = (uint8_t)*p++;
+                if (bytes[i] == 0x1a) {
+                    if (p >= c->eod) { complete = 0; break; }
+                    p++;  // skip escape
+                }
             }
-            int16_t ownship_rate = ((uint8_t)p[0] << 8) | (uint8_t)p[1];
-            int16_t traffic_rate = ((uint8_t)p[2] << 8) | (uint8_t)p[3];
+            
+            if (!complete) break;  // incomplete message
+            
+            int16_t ownship_rate = (bytes[0] << 8) | bytes[1];
+            int16_t traffic_rate = (bytes[2] << 8) | bytes[3];
             Modes.received_efb_ownship_rate = ownship_rate / 10.0f;
             Modes.received_efb_traffic_rate = traffic_rate / 10.0f;
-            c->som += 6;  // 0x1a + E + 4 bytes
+            c->som = p;
             continue;
+        } else if (ch == 'O') {
+            // Ownship command from readsb server
+            // Format: 0x1a + O + type + data
+            // In viewadsb mode, we don't process incoming O commands - viewadsb is authoritative
+            // for its own ownship setting and sends to readsb, not the other way around
+            p++;
+            if (p >= c->eod) {
+                break;  // need more data
+            }
+            char otype = *p++;
+            if (otype == 'X') {
+                // Clear ownship: 0x1a + O + X (3 bytes total)
+                if (!Modes.viewadsb) {
+                    Modes.ownship_hex = 0;
+                    Modes.ownship_callsign[0] = '\0';
+                }
+                c->som = p;
+                continue;
+            } else if (otype == 'H') {
+                // Hex ownship: 0x1a + O + H + 6 hex chars (9 bytes total)
+                if (p + 6 > c->eod) {
+                    break;  // need more data
+                }
+                if (!Modes.viewadsb) {
+                    char hexstr[7];
+                    memcpy(hexstr, p, 6);
+                    hexstr[6] = '\0';
+                    Modes.ownship_hex = (uint32_t)strtol(hexstr, NULL, 16);
+                    Modes.ownship_callsign[0] = '\0';
+                }
+                c->som = p + 6;
+                continue;
+            } else if (otype == 'C') {
+                // Callsign ownship: 0x1a + O + C + 8 callsign chars (11 bytes total)
+                if (p + 8 > c->eod) {
+                    break;  // need more data
+                }
+                if (!Modes.viewadsb) {
+                    memcpy(Modes.ownship_callsign, p, 8);
+                    Modes.ownship_callsign[8] = '\0';
+                    // Trim trailing spaces
+                    for (int i = 7; i >= 0 && Modes.ownship_callsign[i] == ' '; i--) {
+                        Modes.ownship_callsign[i] = '\0';
+                    }
+                    Modes.ownship_hex = 0;
+                }
+                c->som = p + 8;
+                continue;
+            } else {
+                // Unknown O subcommand, skip 0x1a + O + unknown byte
+                c->som = p;
+                continue;
+            }
         } else {
             // Not a valid beast message, skip 0x1a
             // Skip following byte as well:
@@ -6910,6 +7107,9 @@ void efbPeriodicWork(void) {
     if (ownship_sent) {
         Modes.efb_ownship_count++;
     }
+    
+    // Broadcast EFB rates to beast output clients (e.g., viewadsb)
+    broadcastEfbRates();
 }
 
 // ================================ GDL90 Protocol Output ================================
@@ -6961,6 +7161,160 @@ static void gdl90CrcInit(void) {
         gdl90_crc_table[i] = crc;
     }
     gdl90_crc_table_initialized = 1;
+}
+
+// Get current timestamp with fractional seconds for logging
+static void gdl90LogTimestamp(FILE *f) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm *tm = gmtime(&ts.tv_sec);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
+            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+            tm->tm_hour, tm->tm_min, tm->tm_sec,
+            ts.tv_nsec / 1000000);
+}
+
+// Get target IP string
+static const char *gdl90LogTargetIp(void) {
+    static char ip_str[64];
+    if (Modes.gdl90_target_valid) {
+        snprintf(ip_str, sizeof(ip_str), "%s:%d",
+                 inet_ntoa(Modes.gdl90_target_addr.sin_addr),
+                 ntohs(Modes.gdl90_target_addr.sin_port));
+    } else {
+        snprintf(ip_str, sizeof(ip_str), "(no target)");
+    }
+    return ip_str;
+}
+
+// Log GDL90 event
+static void gdl90Log(const char *event_type, const char *format, ...) {
+    if (!Modes.gdl90_log_file)
+        return;
+    
+    gdl90LogTimestamp(Modes.gdl90_log_file);
+    fprintf(Modes.gdl90_log_file, "[%s] %s ", gdl90LogTargetIp(), event_type);
+    
+    va_list args;
+    va_start(args, format);
+    vfprintf(Modes.gdl90_log_file, format, args);
+    va_end(args);
+    
+    fprintf(Modes.gdl90_log_file, "\n");
+}
+
+// Log Heartbeat packet
+static void gdl90LogHeartbeat(void) {
+    if (!Modes.gdl90_log_file)
+        return;
+    
+    // Use synthetic time if in synthetic mode (matches heartbeat message)
+    time_t now_t;
+    if (Modes.synthetic_now) {
+        now_t = Modes.synthetic_now / 1000;
+    } else {
+        now_t = time(NULL);
+    }
+    struct tm *utc = gmtime(&now_t);
+    uint32_t seconds_since_midnight = utc->tm_hour * 3600 + utc->tm_min * 60 + utc->tm_sec;
+    
+    gdl90Log("HEARTBEAT", "time=%02d:%02d:%02d (%u sec)",
+             utc->tm_hour, utc->tm_min, utc->tm_sec, seconds_since_midnight);
+}
+
+// Log Traffic/Ownship Report packet
+static void gdl90LogTrafficReport(struct aircraft *a, int is_ownship) {
+    if (!Modes.gdl90_log_file)
+        return;
+    
+    int altitude_ft = 0;
+    const char *alt_source = "none";
+    if (trackDataValid(&a->baro_alt_valid)) {
+        altitude_ft = a->baro_alt;
+        alt_source = "baro";
+    } else if (trackDataValid(&a->geom_alt_valid)) {
+        altitude_ft = a->geom_alt;
+        alt_source = "geom";
+    }
+    
+    int airborne = 1;
+    if (trackDataValid(&a->airground_valid)) {
+        airborne = (a->airground == AG_AIRBORNE) ? 1 : 0;
+    }
+    
+    float track = 0;
+    if (trackDataValid(&a->track_valid)) {
+        track = a->track;
+    } else if (trackDataValid(&a->mag_heading_valid)) {
+        track = a->mag_heading;
+    }
+    
+    float gs = trackDataValid(&a->gs_valid) ? a->gs : 0;
+    
+    int vrate = 0;
+    const char *vrate_source = "none";
+    if (trackDataValid(&a->baro_rate_valid)) {
+        vrate = a->baro_rate;
+        vrate_source = "baro";
+    } else if (trackDataValid(&a->geom_rate_valid)) {
+        vrate = a->geom_rate;
+        vrate_source = "geom";
+    }
+    
+    uint8_t nic = trackDataValid(&a->position_valid) ? a->pos_nic : 0;
+    uint8_t nacp = trackDataValid(&a->nac_p_valid) ? a->nac_p : 0;
+    
+    int pos_valid = trackDataValid(&a->position_valid);
+    
+    gdl90Log(is_ownship ? "OWNSHIP" : "TRAFFIC",
+             "addr=%06X callsign=%.8s lat=%.6f lon=%.6f pos_valid=%d alt=%dft(%s) "
+             "airborne=%d gs=%.1fkts trk=%.1f vrate=%dfpm(%s) nic=%d nacp=%d cat=%02X",
+             a->addr, a->callsign, a->lat, a->lon, pos_valid, altitude_ft, alt_source,
+             airborne, gs, track, vrate, vrate_source, nic, nacp, a->category);
+}
+
+// Log Ownship Geometric Altitude packet
+static void gdl90LogOwnshipAlt(struct aircraft *a) {
+    if (!Modes.gdl90_log_file)
+        return;
+    
+    int geom_alt = trackDataValid(&a->geom_alt_valid) ? a->geom_alt : 0;
+    int vert_warn = 0;  // Not implemented
+    
+    gdl90Log("OWNSHIP_ALT", "addr=%06X geom_alt=%dft vert_warn=%d",
+             a->addr, geom_alt, vert_warn);
+}
+
+// Log ForeFlight ID packet
+static void gdl90LogForeFlightId(struct aircraft *ownship) {
+    if (!Modes.gdl90_log_file)
+        return;
+    
+    if (ownship) {
+        gdl90Log("FF_ID", "device=readsb callsign=%.8s", ownship->callsign);
+    } else {
+        gdl90Log("FF_ID", "device=readsb callsign=(none)");
+    }
+}
+
+// Log AHRS packet
+static void gdl90LogAHRS(struct aircraft *a) {
+    if (!Modes.gdl90_log_file)
+        return;
+    
+    float roll = trackDataValid(&a->roll_valid) ? a->roll : 0;
+    float pitch = 0;  // We always send 0 (level flight) since ADS-B doesn't provide pitch
+    float heading = 0;
+    if (trackDataValid(&a->mag_heading_valid)) {
+        heading = a->mag_heading;
+    } else if (trackDataValid(&a->track_valid)) {
+        heading = a->track;
+    }
+    int ias = trackDataValid(&a->ias_valid) ? a->ias : 0;
+    int tas = trackDataValid(&a->tas_valid) ? a->tas : 0;
+    
+    gdl90Log("AHRS", "addr=%06X roll=%.1f pitch=%.1f hdg=%.1f ias=%d tas=%d",
+             a->addr, roll, pitch, heading, ias, tas);
 }
 
 // Calculate CRC-CCITT
@@ -7036,10 +7390,10 @@ static int32_t gdl90EncodeLatLon(double deg) {
     return encoded & 0xFFFFFF;
 }
 
-// Encode altitude for GDL90 (25-foot resolution, offset by 1000 feet)
+// Encode altitude for GDL90 (25-foot resolution, offset by 1000)
+// GDL90 spec: Altitude = (encoded * 25) - 1000 feet
+// Therefore:  encoded = (altitude + 1000) / 25
 static uint16_t gdl90EncodeAltitude(int alt_ft) {
-    // Altitude = (encoded * 25) - 1000
-    // encoded = (altitude + 1000) / 25
     int encoded = (alt_ft + 1000) / 25;
     if (encoded < 0) encoded = 0;
     if (encoded > 0xFFE) encoded = 0xFFE;
@@ -7099,8 +7453,13 @@ static uint8_t gdl90ConvertCategory(uint32_t adsb_category) {
 static int gdl90BuildHeartbeat(uint8_t *msg, int size) {
     if (size < 7) return -1;
 
-    // Get current time
-    time_t now_t = time(NULL);
+    // Get current time - use synthetic time if in synthetic mode
+    time_t now_t;
+    if (Modes.synthetic_now) {
+        now_t = Modes.synthetic_now / 1000;  // Convert ms to seconds
+    } else {
+        now_t = time(NULL);
+    }
     struct tm *utc = gmtime(&now_t);
     uint32_t seconds_since_midnight = utc->tm_hour * 3600 + utc->tm_min * 60 + utc->tm_sec;
 
@@ -7271,31 +7630,10 @@ static int gdl90BuildOwnshipAlt(uint8_t *msg, int size, struct aircraft *a) {
     // Bit 15: Vertical warning (0 = no warning)
     // Bits 14-0: VFOM in meters (0x7FFF = not available)
     //
-    // GVA (Geometric Vertical Accuracy) from ADS-B:
-    //   0 = Unknown
-    //   1 = < 150 meters
-    //   2 = < 45 meters
-    //   3 = Reserved
-    //
-    // If GVA is not available, default to 45m (typical GPS accuracy)
-    // since ForeFlight may discard the altitude if VFOM is "not available"
-    uint16_t vfom = 45;  // Default: 45 meters (reasonable GPS accuracy)
-    if (trackDataValid(&a->gva_valid)) {
-        switch (a->gva) {
-            case 1:
-                vfom = 150;  // < 150 meters
-                break;
-            case 2:
-                vfom = 45;   // < 45 meters
-                break;
-            case 0:
-            case 3:
-            default:
-                // GVA 0 or 3: unknown/reserved, use default
-                vfom = 45;
-                break;
-        }
-    }
+    // ForeFlight requires VFOM to be small (appears to reject values > ~50m)
+    // Always report 45m for compatibility, regardless of actual GVA
+    // GVA from ADS-B indicates accuracy but ForeFlight PFD needs tight VFOM
+    uint16_t vfom = 45;  // Always use 45m for ForeFlight compatibility
 
     // Vertical warning bit is 0 (no warning), VFOM in bits 14-0
     msg[3] = (vfom >> 8) & 0x7F;  // Clear bit 15 (no warning)
@@ -7392,9 +7730,11 @@ static int gdl90BuildAHRS(uint8_t *msg, int size, struct aircraft *a) {
     msg[3] = roll_val & 0xFF;
 
     // Pitch (16-bit signed, 1/10 degree resolution)
-    // Always invalid as we don't have pitch data from ADS-B
-    msg[4] = 0x7F;
-    msg[5] = 0xFF;
+    // ADS-B doesn't provide pitch, so we assume level flight (0 degrees)
+    // Note: Setting 0x7FFF (invalid) causes ForeFlight to not display PFD altitude
+    int16_t pitch_val = 0;  // Assume level flight
+    msg[4] = (pitch_val >> 8) & 0xFF;
+    msg[5] = pitch_val & 0xFF;
 
     // Heading (16-bit)
     // Bit 15: 0 = True heading, 1 = Magnetic heading
@@ -7500,15 +7840,19 @@ static void gdl90ProcessDiscovery(void) {
             }
         }
 
+        int was_valid = Modes.gdl90_target_valid;
+
         // Update target address
         memset(&Modes.gdl90_target_addr, 0, sizeof(Modes.gdl90_target_addr));
         Modes.gdl90_target_addr.sin_family = AF_INET;
         Modes.gdl90_target_addr.sin_addr = sender_addr.sin_addr;
         Modes.gdl90_target_addr.sin_port = htons(port);
 
-        if (!Modes.gdl90_target_valid) {
+        if (!was_valid) {
             fprintf(stderr, "GDL90: Discovered EFB at %s:%d\n",
                     inet_ntoa(sender_addr.sin_addr), port);
+            gdl90Log("DISCOVERY", "EFB discovered at %s:%d",
+                     inet_ntoa(sender_addr.sin_addr), port);
         }
 
         Modes.gdl90_target_valid = 1;
@@ -7549,6 +7893,7 @@ void gdl90Init(void) {
         }
         Modes.gdl90_target_valid = 1;
         fprintf(stderr, "GDL90: Sending to %s:%d\n", Modes.gdl90_ip, Modes.gdl90_port);
+        gdl90Log("STATIC_IP", "Configured to send to %s:%d", Modes.gdl90_ip, Modes.gdl90_port);
     } else {
         // No static IP - set up discovery listener
         // Create listening socket for EFB discovery broadcasts (port 63093)
@@ -7593,6 +7938,9 @@ void gdl90Init(void) {
 }
 
 void gdl90Close(void) {
+    if (Modes.gdl90_listen_fd >= 0 || Modes.gdl90_send_fd >= 0) {
+        gdl90Log("SHUTDOWN", "Closing GDL90");
+    }
     if (Modes.gdl90_listen_fd >= 0) {
         close(Modes.gdl90_listen_fd);
         Modes.gdl90_listen_fd = -1;
@@ -7618,9 +7966,14 @@ void gdl90PeriodicWork(void) {
         // Check if target has timed out (use monotonic time)
         if (Modes.gdl90_target_valid && mono > Modes.gdl90_target_timeout) {
             fprintf(stderr, "GDL90: EFB connection timed out\n");
+            gdl90Log("TIMEOUT", "EFB connection timed out");
             Modes.gdl90_target_valid = 0;
         }
     }
+
+    // Broadcast EFB rates to beast output clients (e.g., viewadsb)
+    // Always do this even if target is not valid, to keep tracking rates
+    broadcastEfbRates();
 
     // Only send if we have a valid target
     if (!Modes.gdl90_target_valid)
@@ -7645,6 +7998,7 @@ void gdl90PeriodicWork(void) {
         msg_len = gdl90BuildHeartbeat(msg, sizeof(msg));
         if (msg_len > 0) {
             gdl90Send(msg, msg_len);
+            gdl90LogHeartbeat();
         }
     }
 
@@ -7682,24 +8036,28 @@ void gdl90PeriodicWork(void) {
         msg_len = gdl90BuildAHRS(msg, sizeof(msg), ownship);
         if (msg_len > 0) {
             gdl90Send(msg, msg_len);
+            gdl90LogAHRS(ownship);
         }
 
         // Send Ownship Report
         msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), ownship, 1);
         if (msg_len > 0) {
             gdl90Send(msg, msg_len);
+            gdl90LogTrafficReport(ownship, 1);
         }
 
         // Send Ownship Geometric Altitude
         msg_len = gdl90BuildOwnshipAlt(msg, sizeof(msg), ownship);
         if (msg_len > 0) {
             gdl90Send(msg, msg_len);
+            gdl90LogOwnshipAlt(ownship);
         }
 
         // Send ForeFlight ID message at 5Hz too (contains ownship info)
         msg_len = gdl90BuildForeFlightId(msg, sizeof(msg), ownship);
         if (msg_len > 0) {
             gdl90Send(msg, msg_len);
+            gdl90LogForeFlightId(ownship);
         }
 
         Modes.efb_ownship_count++;
@@ -7737,6 +8095,7 @@ void gdl90PeriodicWork(void) {
             msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
             if (msg_len > 0) {
                 gdl90Send(msg, msg_len);
+                gdl90LogTrafficReport(a, 0);
             }
         }
         ca_unlock_read(ca);
@@ -7763,6 +8122,7 @@ void gdl90PeriodicWork(void) {
                 msg_len = gdl90BuildTrafficReport(msg, sizeof(msg), a, 0);
                 if (msg_len > 0) {
                     gdl90Send(msg, msg_len);
+                    gdl90LogTrafficReport(a, 0);
                 }
             }
         }

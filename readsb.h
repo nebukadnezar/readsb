@@ -997,6 +997,7 @@ struct _Modes
     int64_t gdl90_target_timeout;   // When the target address expires
     int64_t gdl90_next_update;      // Next time to send GDL90 traffic data (1Hz)
     int64_t gdl90_ownship_next_update; // Next time to send GDL90 ownship data (5Hz)
+    FILE *gdl90_log_file;           // Log file for GDL90 debugging
 
     // EFB rate tracking (for display in viewadsb)
     int efb_ownship_count;          // Ownship messages sent in current period
@@ -1416,6 +1417,7 @@ enum {
     OptSendXtraffic,
     OptGdl90,
     OptGdl90Ip,
+    OptGdl90Log,
 };
 
 

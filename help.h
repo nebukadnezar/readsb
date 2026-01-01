@@ -181,6 +181,7 @@ static struct argp_option optionsReadsb[] = {
     {"sendxtraffic", OptSendXtraffic, 0, 0, "Send XTRAFFIC messages for traffic to --efb-ip", 2},
     {"gdl90", OptGdl90, 0, 0, "Enable GDL90 protocol output. Listens for EFB announcements and sends via UDP unicast.", 2},
     {"gdl90-ip", OptGdl90Ip, "<ip[:port]>", 0, "Send GDL90 data to this IP address (default port: 4000). Overrides ForeFlight discovery.", 2},
+    {"gdl90log", OptGdl90Log, "<logfile>", 0, "Log all GDL90 events to file (discovery, disconnect, packets sent)", 2},
 #ifdef ENABLE_RTLSDR
     {0,0,0,0, "RTL-SDR options:", 3},
     {0,0,0, OPTION_DOC, "use with --device-type rtlsdr", 3},

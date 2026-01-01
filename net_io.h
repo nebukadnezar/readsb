@@ -209,6 +209,7 @@ void sendBeastSettings (int fd, const char *settings);
 void sendOwnshipCommand(int fd, char type, const char *value);
 void broadcastGain(void);
 void broadcastEfbRates(void);
+void broadcastOwnshipConfig(void);
 void sendData(struct net_writer *output, char *data, int len);
 
 void modesInitNet (void);

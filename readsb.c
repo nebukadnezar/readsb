@@ -1784,6 +1784,16 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 fprintf(stderr, "GDL90 output enabled, sending to %s:%d\n", Modes.gdl90_ip, Modes.gdl90_port);
             }
             break;
+        case OptGdl90Log:
+            Modes.gdl90_log_file = fopen(arg, "a");
+            if (!Modes.gdl90_log_file) {
+                fprintf(stderr, "Error: Cannot open GDL90 log file '%s': %s\n", arg, strerror(errno));
+                return 1;
+            }
+            // Set line buffering for real-time logging
+            setvbuf(Modes.gdl90_log_file, NULL, _IOLBF, 0);
+            fprintf(stderr, "GDL90 logging enabled to %s\n", arg);
+            break;
         case OptDevice:
             Modes.dev_name = strdup(arg);
             break;
