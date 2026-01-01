@@ -4773,6 +4773,8 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
     MODES_NOTUSED(remote);
     // 0x1a | 0xec | s/l/u byte (short / long / uplink) | 6 byte MLAT timestamp | rssi byte |  payload
 
+    int debugIncomplete = 0;
+
     char buf[2048];
     char *out = buf;
     char *end = buf + sizeof(buf);
@@ -4782,6 +4784,10 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
     if (*p == 'u') {
         bytes = 552;
         out = safe_snprintf(out, end, "+");
+        if (debugIncomplete) {
+            fprintTimePrecise(stderr, mstime());
+            fprintf(stderr, "uat uplink bytes in buffer: %d\n", (int) (c->eod - p));
+        }
     } else if (*p == 's') {
         bytes = 30;
         out = safe_snprintf(out, end, "-");
@@ -4795,6 +4801,9 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
 
     if (c->eod - p  < 1 + 6 + 1 + bytes) {
         // message is guaranteed to be incomplete
+        if (debugIncomplete) {
+            fprintf(stderr, "uat_incomplete %d < %d\n", (int) (c->eod - p), 1 + 6 + 1 + bytes);
+        }
         return 0;
     }
 
@@ -4821,12 +4830,18 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
     for (int j = 0; j < bytes; j++) {
         if (p >= c->eod) {
             // incomplete message
+            if (debugIncomplete) {
+                fprintf(stderr, "uat_incomplete %d\n", __LINE__);
+            }
             return 0;
         }
         if (*p == 0x1a) {
             p++;
             if (p >= c->eod) {
                 // incomplete message
+                if (debugIncomplete) {
+                    fprintf(stderr, "uat_incomplete %d\n", __LINE__);
+                }
                 return 0;
             }
             if (*p != 0x1a) {
@@ -4848,6 +4863,9 @@ static int decodeEncapsulatedUAT(struct client *c, char *msg, int remote, int64_
     //fprintf(stderr, "passing to decodeUatMessage: %s\n", buf);
     decodeUatMessage(c, buf, 1, now, mb);
 
+    if (p - msg == 0 && debugIncomplete) {
+        fprintf(stderr, "uat_incomplete %d\n", __LINE__);
+    }
     return (p - msg);
 }
 
@@ -4930,6 +4948,13 @@ static const char *hexDumpString(const char *str, int strlen, char *buf, int buf
     return buf;
 }
 
+static void garbageIncrement(struct client *c, int add, int line) {
+    if (0) {
+        fprintf(stderr, "garbageIncrement: %4d line: %4d\n", add, line);
+    }
+    c->garbage += add;
+}
+
 
 //
 //=========================================================================
@@ -4947,7 +4972,7 @@ static int readClient(struct client *c, int64_t now) {
 
     // If our buffer is full discard it, this is some badly formatted shit
     if (left <= 0) {
-        c->garbage += c->buflen;
+        garbageIncrement(c, c->buflen, __LINE__);
         Modes.stats_current.remote_malformed_beast += c->buflen;
 
         c->buflen = 0;
@@ -5308,7 +5333,9 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
 
     while (c->som < c->eod && ((p = memchr(c->som, (char) 0x1a, c->eod - c->som)) != NULL)) { // The first byte of buffer 'should' be 0x1a
 
-        c->garbage += p - c->som;
+        if (p > c->som) {
+            garbageIncrement(c, p - c->som, __LINE__);
+        }
         Modes.stats_current.remote_malformed_beast += p - c->som;
 
         //lastSom = p;
@@ -5408,7 +5435,7 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
                     eom++;
                     if (p < c->eod && ch != 0x1A) { // check that it's indeed a double escape
                                                  // might be start of message rather than double escape.
-                        c->garbage += p - 1 - c->som;
+                        garbageIncrement(c, p - 1 - c->som, __LINE__);
                         Modes.stats_current.remote_malformed_beast += p - 1 - c->som;
                         c->som = p - 1;
                         goto beastWhileContinue;
@@ -5671,7 +5698,7 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             // or: any other char is skipped anyhow when looking for the next 0x1a
             c->som += 2;
             Modes.stats_current.remote_malformed_beast += 2;
-            c->garbage += 2;
+            garbageIncrement(c, 2, __LINE__);
             continue;
         }
 
@@ -5696,7 +5723,7 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
                     if (*p != (char) 0x1A) { // check that it's indeed a double escape
                                              // might be start of message rather than double escape.
                                              //
-                        c->garbage += p - 1 - c->som;
+                        garbageIncrement(c, p - 1 - c->som, __LINE__);
                         Modes.stats_current.remote_malformed_beast += p - 1 - c->som;
                         c->som = p - 1;
 
@@ -5752,9 +5779,12 @@ beastWhileContinue:
         ;
     }
 
-    if (c->eod - c->som > 256) {
+    if (0 && c->eod - c->som > 256) {
+        fprintf(stderr, "beastWhile >256 remaining: %d\n", (int) (c->eod - c->som));
+    }
+    if (c->eod - c->som > 600) {
         //fprintf(stderr, "beastWhile too much data remaining, garbage?!\n");
-        c->garbage += c->eod - c->som;
+        garbageIncrement(c, c->eod - c->som, __LINE__);
         Modes.stats_current.remote_malformed_beast += c->eod - c->som;
         c->som = c->eod;
     }

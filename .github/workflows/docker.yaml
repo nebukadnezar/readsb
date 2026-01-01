@@ -63,3 +63,4 @@ jobs:
         platforms: linux/amd64,linux/arm64
         build-args: |
           BUILDKIT_CONTEXT_KEEP_GIT_DIR=true
+        outputs: type=image,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true

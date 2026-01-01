@@ -33,6 +33,8 @@
 
 #define sfree(x) do { free(x); x = NULL; } while (0)
 
+#define debugpl do { fprintf(stderr, "debugpl: %s %d\n",  __FILE__, __LINE__); } while (0)
+
 #define HOURS (60*60*1000LL)
 #define MINUTES (60*1000LL)
 #define SECONDS (1000LL)
