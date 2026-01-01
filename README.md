@@ -414,6 +414,18 @@ BDS 6,0 — Heading and Speed Report
 [Australia / New Zealand BDS6 coverage](https://rtwa.flyrealtraffic.com/BDS6_AUNZ.jpg)
 [Europe BDS6 coverage](https://rtwa.flyrealtraffic.com/BDS6_Europe.jpg)
 
+## Playback of recorded beast dumps
+You can use the dump_playback.py script to feed recorded beast data into an instance of readsb:
+
+Run readsb in synthetic mode:
+```./readsb --devel=accept_synthetic --net-only --net-bi-port 30004,30104 --quiet --net-bo-port 30005 --net-bi-port 30015,30115```
+
+and then play back the data either from the same host or to another host (using the --host parameter) - default is localhost:
+
+```./dump_playback.py beast.dump/*.zst --stream -v```
+
+
+
 ## readsb --help
 
 might be out of date, check the command on a freshly compiled version
@@ -540,6 +552,7 @@ Network options:
   --sendxtraffic                                                 Send XTRAFFIC messages for traffic to --efb-ip
   --gdl90                                                        Enable GDL90 protocol output. Listens for EFB announcements and sends via UDP unicast.
   --gdl90-ip=<ip[:port]>                                         Send GDL90 data to this IP address (default port: 4000). Overrides ForeFlight discovery.
+  --gdl90log=<logfile>                                           Log all GDL90 events to file (discovery, disconnect, packets sent)
 
 RTL-SDR options:
 
