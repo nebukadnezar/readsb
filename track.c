@@ -68,6 +68,38 @@ static inline int declination(struct aircraft *a, double *dec, int64_t now);
 static const char *source_string(datasource_t source);
 static void incrementReliable(struct aircraft *a, struct modesMessage *mm, int64_t now, int odd);
 
+// Check if an aircraft is the configured ownship (by hex ID or callsign)
+static int trackIsOwnship(struct aircraft *a) {
+    if (!a) return 0;
+
+    // Check by hex ID if configured
+    if (Modes.ownship_hex && (a->addr == Modes.ownship_hex)) {
+        return 1;
+    }
+
+    // Check by callsign if configured
+    if (Modes.ownship_callsign[0] && a->callsign[0]) {
+        const char *cs1 = Modes.ownship_callsign;
+        const char *cs2 = a->callsign;
+        while (*cs1 && *cs2) {
+            char c1 = *cs1;
+            char c2 = *cs2;
+            if (c1 >= 'a' && c1 <= 'z') c1 -= 32;
+            if (c2 >= 'a' && c2 <= 'z') c2 -= 32;
+            if (c1 != c2) return 0;
+            cs1++;
+            cs2++;
+        }
+        while (*cs1 == ' ') cs1++;
+        while (*cs2 == ' ') cs2++;
+        if (*cs1 == '\0' && *cs2 == '\0') {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static uint16_t simpleHash(uint64_t receiverId) {
     uint16_t simpleHash = receiverId;
     simpleHash ^= (uint16_t) (receiverId >> 16);
@@ -793,6 +825,12 @@ static int doGlobalCPR(struct aircraft *a, struct modesMessage *mm, double *lat,
             reflat = a->latReliable;
             reflon = a->lonReliable;
             ref = 3;
+        } else if (trackIsOwnship(a) && a->seen_pos) {
+            // Ownship special case: use any prior position as reference
+            // This is more lenient than option 3 to help bootstrap ownship position
+            reflat = a->lat;
+            reflon = a->lon;
+            ref = 4;
         } else {
             // No local reference, give up
             return (-1);
@@ -929,6 +967,12 @@ static int doLocalCPR(struct aircraft *a, struct modesMessage *mm, double *lat, 
             return (-1); // Can't do receiver-centered checks at all
         }
         relative_to = 2;
+    } else if (trackIsOwnship(a) && a->seen_pos) {
+        // Ownship special case: use any prior position as reference
+        reflat = a->lat;
+        reflon = a->lon;
+        range_limit = 1852 * 100; // 100 NM limit for safety
+        relative_to = 1;
     } else {
         // No local reference, give up
         return (-1);
@@ -1137,6 +1181,24 @@ static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now
 
 
     a->pos_surface = trackDataValid(&a->airground_valid) && a->airground == AG_GROUND;
+
+    // If this is the configured ownship, update receiver position from ownship
+    // This enables surface CPR decoding for ownship and nearby traffic
+    if (trackIsOwnship(a)) {
+        Modes.fUserLat = a->lat;
+        Modes.fUserLon = a->lon;
+        Modes.userLocationValid = 1;
+        // Enable userLocationRef for surface CPR if max-range allows
+        // Use a reasonable default max range for ownship (360 NM)
+        if (!Modes.userLocationRef) {
+            if (Modes.maxRange == 0) {
+                Modes.maxRange = 360 * 1852;  // 360 NM default for ownship
+            }
+            if (Modes.maxRange < 1852 * 800) {
+                Modes.userLocationRef = 1;
+            }
+        }
+    }
 
     // due to the position deduplication logic we won't put receivers
     // into the receiver list which aren't the first ones to send us the position
