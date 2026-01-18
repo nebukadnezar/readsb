@@ -7640,19 +7640,26 @@ static int gdl90BuildTrafficReport(uint8_t *msg, int size, struct aircraft *a, i
 
 // Build GDL90 Ownship Geometric Altitude message (Message ID 11)
 // Per GDL90 spec 3.8: Only output when geometric altitude is available
+// For ForeFlight compatibility, fall back to barometric altitude when geometric isn't available
 static int gdl90BuildOwnshipAlt(uint8_t *msg, int size, struct aircraft *a) {
     if (size < 5) return -1;
 
-    // Only send if we have valid geometric altitude
-    if (!trackDataValid(&a->geom_alt_valid)) {
-        return 0;  // Return 0 to indicate no message to send
+    // Get altitude - prefer geometric, fall back to barometric for ForeFlight GPS compatibility
+    int altitude_ft = 0;
+    if (trackDataValid(&a->geom_alt_valid)) {
+        altitude_ft = a->geom_alt;
+    } else if (trackDataValid(&a->baro_alt_valid)) {
+        // Use barometric as fallback (close enough on ground for GPS display)
+        altitude_ft = a->baro_alt;
+    } else {
+        return 0;  // No altitude available at all
     }
 
     msg[0] = GDL90_MSG_OWNSHIP_ALT;
 
     // Geometric altitude (16-bit signed, 5-foot resolution)
     // GDL90 spec: Geo Altitude (ft) = encoded_value * 5
-    int16_t alt_enc = a->geom_alt / 5;
+    int16_t alt_enc = altitude_ft / 5;
     msg[1] = (alt_enc >> 8) & 0xFF;  // MSB first (big-endian)
     msg[2] = alt_enc & 0xFF;
 
