@@ -5641,8 +5641,7 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
         } else if (ch == 'O') {
             // Ownship command from readsb server
             // Format: 0x1a + O + type + data
-            // In viewadsb mode, we don't process incoming O commands - viewadsb is authoritative
-            // for its own ownship setting and sends to readsb, not the other way around
+            // Always set Modes.ownship_* so trackIsOwnship() works for surface CPR decoding
             p++;
             if (p >= c->eod) {
                 break;  // need more data
@@ -5650,10 +5649,8 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             char otype = *p++;
             if (otype == 'X') {
                 // Clear ownship: 0x1a + O + X (3 bytes total)
-                if (!Modes.viewadsb) {
-                    Modes.ownship_hex = 0;
-                    Modes.ownship_callsign[0] = '\0';
-                }
+                Modes.ownship_hex = 0;
+                Modes.ownship_callsign[0] = '\0';
                 c->som = p;
                 continue;
             } else if (otype == 'H') {
@@ -5661,13 +5658,11 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
                 if (p + 6 > c->eod) {
                     break;  // need more data
                 }
-                if (!Modes.viewadsb) {
-                    char hexstr[7];
-                    memcpy(hexstr, p, 6);
-                    hexstr[6] = '\0';
-                    Modes.ownship_hex = (uint32_t)strtol(hexstr, NULL, 16);
-                    Modes.ownship_callsign[0] = '\0';
-                }
+                char hexstr[7];
+                memcpy(hexstr, p, 6);
+                hexstr[6] = '\0';
+                Modes.ownship_hex = (uint32_t)strtol(hexstr, NULL, 16);
+                Modes.ownship_callsign[0] = '\0';
                 c->som = p + 6;
                 continue;
             } else if (otype == 'C') {
@@ -5675,15 +5670,13 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
                 if (p + 8 > c->eod) {
                     break;  // need more data
                 }
-                if (!Modes.viewadsb) {
-                    memcpy(Modes.ownship_callsign, p, 8);
-                    Modes.ownship_callsign[8] = '\0';
-                    // Trim trailing spaces
-                    for (int i = 7; i >= 0 && Modes.ownship_callsign[i] == ' '; i--) {
-                        Modes.ownship_callsign[i] = '\0';
-                    }
-                    Modes.ownship_hex = 0;
+                memcpy(Modes.ownship_callsign, p, 8);
+                Modes.ownship_callsign[8] = '\0';
+                // Trim trailing spaces
+                for (int i = 7; i >= 0 && Modes.ownship_callsign[i] == ' '; i--) {
+                    Modes.ownship_callsign[i] = '\0';
                 }
+                Modes.ownship_hex = 0;
                 c->som = p + 8;
                 continue;
             } else {

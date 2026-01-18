@@ -831,6 +831,23 @@ static int doGlobalCPR(struct aircraft *a, struct modesMessage *mm, double *lat,
             reflat = a->lat;
             reflon = a->lon;
             ref = 4;
+        } else if (trackIsOwnship(a)) {
+            // Ownship cold start: try to find ANY nearby aircraft with valid position
+            // to use as reference for surface CPR bootstrap
+            struct craftArray *ca = &Modes.aircraftActive;
+            int found = 0;
+            for (int i = 0; i < ca->len && !found; i++) {
+                struct aircraft *other = ca->list[i];
+                if (other && other != a && other->seen_pos && trackDataValid(&other->position_valid)) {
+                    reflat = other->lat;
+                    reflon = other->lon;
+                    ref = 5;
+                    found = 1;
+                }
+            }
+            if (!found) {
+                return (-1);
+            }
         } else {
             // No local reference, give up
             return (-1);
@@ -841,10 +858,18 @@ static int doGlobalCPR(struct aircraft *a, struct modesMessage *mm, double *lat,
                 a->cpr_odd_lat, a->cpr_odd_lon,
                 fflag,
                 lat, lon);
+        if (result < 0) {
+            if (Modes.debug_cpr) {
+                fprintf(stderr, "%06x CPRsurface decode failed (result=%d) ref=(%.3f,%.3f)\n",
+                        a->addr, result, reflat, reflon);
+            }
+            return result;
+        }
         double refDistance = greatcircle(reflat, reflon, *lat, *lon, 0);
         if (refDistance > 450e3) {
-            if (0 && (a->addr == Modes.cpr_focus || Modes.debug_cpr)) {
-                fprintf(stderr, "%06x CPRsurface ref %d refDistance: %4.0f km (%4.0f, %4.0f) allow_ac_rel %d\n", a->addr, ref, refDistance / 1000.0, reflat, reflon, a->surfaceCPR_allow_ac_rel);
+            if (Modes.debug_cpr) {
+                fprintf(stderr, "%06x CPRsurface ref %d refDistance: %4.0f km too far, rejecting\n",
+                        a->addr, ref, refDistance / 1000.0);
             }
             // change to failure which doesn't decrement reliable
             result = -1;
@@ -973,6 +998,23 @@ static int doLocalCPR(struct aircraft *a, struct modesMessage *mm, double *lat, 
         reflon = a->lon;
         range_limit = 1852 * 100; // 100 NM limit for safety
         relative_to = 1;
+    } else if (trackIsOwnship(a)) {
+        // Ownship cold start: try to find ANY nearby aircraft with valid position
+        struct craftArray *ca = &Modes.aircraftActive;
+        int found = 0;
+        for (int i = 0; i < ca->len && !found; i++) {
+            struct aircraft *other = ca->list[i];
+            if (other && other != a && other->seen_pos && trackDataValid(&other->position_valid)) {
+                reflat = other->lat;
+                reflon = other->lon;
+                range_limit = 1852 * 100; // 100 NM limit for safety
+                relative_to = 1;
+                found = 1;
+            }
+        }
+        if (!found) {
+            return (-1);
+        }
     } else {
         // No local reference, give up
         return (-1);
@@ -1113,9 +1155,6 @@ static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now
     }
 
     if (bogus_lat_lon(mm->decoded_lat, mm->decoded_lon)) {
-        if (0 && (fabs(mm->decoded_lat) >= 90.0 || fabs(mm->decoded_lon) >= 180.0)) {
-            fprintf(stderr, "%06x lat,lon out of bounds: %.2f,%.2f source: %s\n", a->addr, mm->decoded_lat, mm->decoded_lon, source_enum_string(mm->source));
-        }
         return;
     }
 
