@@ -356,15 +356,6 @@ void interactiveSendNicNacp(void) {
     static int last_sent_nacp_min = -1;
     static int64_t last_connect_time = 0;
 
-    // Sync from server broadcasts (another viewadsb may have changed values)
-    if (Modes.gdl90_nic_min != viewadsb_nic_min || Modes.gdl90_nacp_min != viewadsb_nacp_min) {
-        // Only update local if we haven't made a local change
-        if (viewadsb_nic_min == last_sent_nic_min && viewadsb_nacp_min == last_sent_nacp_min) {
-            viewadsb_nic_min = Modes.gdl90_nic_min;
-            viewadsb_nacp_min = Modes.gdl90_nacp_min;
-        }
-    }
-
     if (Modes.net_connectors_count == 0) return;
     struct net_connector *con = &Modes.net_connectors[0];
     if (!con->connected || con->fd < 0) return;
