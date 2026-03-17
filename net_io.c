@@ -5692,6 +5692,17 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             Modes.received_efb_traffic_rate = traffic_rate / 10.0f;
             c->som = p;
             continue;
+        } else if (ch == 'N') {
+            // NIC/NACp clamping command from readsb server
+            // Format: 0x1a + N + nic_min (1 byte) + nacp_min (1 byte)
+            p++;
+            if (p + 1 >= c->eod) break;  // need 2 more bytes
+            int nic_min = (uint8_t)*p++ & 0x0F;
+            int nacp_min = (uint8_t)*p++ & 0x0F;
+            Modes.gdl90_nic_min = nic_min;
+            Modes.gdl90_nacp_min = nacp_min;
+            c->som = p;
+            continue;
         } else if (ch == 'O') {
             // Ownship command from readsb server
             // Format: 0x1a + O + type + data
