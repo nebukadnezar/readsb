@@ -108,6 +108,13 @@ static int ownship_initialized = 0;  // 1 after first ownship setup from command
 static uint32_t viewadsb_ownship_hex = 0;
 static char viewadsb_ownship_callsign[9] = "";
 
+// NIC/NACp clamping input state for viewadsb
+static int nicnacp_input_active = 0;
+static char nicnacp_input[16];
+static int nicnacp_input_len = 0;
+static int viewadsb_nic_min = 0;
+static int viewadsb_nacp_min = 0;
+
 // Sort mode for viewadsb
 typedef enum {
     SORT_DISTANCE = 0,
@@ -311,6 +318,70 @@ void interactiveSendOwnship(void) {
             last_sent_hex = 0;
             last_sent_callsign[0] = '\0';
         }
+    }
+}
+
+// Parse NIC/NACp input: "8,9" -> nic=8 nacp=9, "8" -> nic=8 nacp=8
+static void setNicNacpFromInput(const char *input) {
+    if (!input || input[0] == '\0') {
+        viewadsb_nic_min = 0;
+        viewadsb_nacp_min = 0;
+        return;
+    }
+
+    int nic = 0, nacp = 0;
+    const char *comma = strchr(input, ',');
+    if (comma) {
+        nic = atoi(input);
+        nacp = atoi(comma + 1);
+    } else {
+        nic = atoi(input);
+        nacp = nic;
+    }
+
+    if (nic < 0) nic = 0;
+    if (nic > 15) nic = 15;
+    if (nacp < 0) nacp = 0;
+    if (nacp > 15) nacp = 15;
+
+    viewadsb_nic_min = nic;
+    viewadsb_nacp_min = nacp;
+}
+
+// Periodically send NIC/NACp clamping to server (viewadsb only)
+void interactiveSendNicNacp(void) {
+    if (!Modes.viewadsb) return;
+
+    static int last_sent_nic_min = -1;
+    static int last_sent_nacp_min = -1;
+    static int64_t last_connect_time = 0;
+
+    // Sync from server broadcasts (another viewadsb may have changed values)
+    if (Modes.gdl90_nic_min != viewadsb_nic_min || Modes.gdl90_nacp_min != viewadsb_nacp_min) {
+        // Only update local if we haven't made a local change
+        if (viewadsb_nic_min == last_sent_nic_min && viewadsb_nacp_min == last_sent_nacp_min) {
+            viewadsb_nic_min = Modes.gdl90_nic_min;
+            viewadsb_nacp_min = Modes.gdl90_nacp_min;
+        }
+    }
+
+    if (Modes.net_connectors_count == 0) return;
+    struct net_connector *con = &Modes.net_connectors[0];
+    if (!con->connected || con->fd < 0) return;
+
+    // Detect reconnection
+    int reconnected = (con->lastConnect != last_connect_time);
+    if (reconnected) {
+        last_connect_time = con->lastConnect;
+        last_sent_nic_min = -1;
+        last_sent_nacp_min = -1;
+    }
+
+    // Only send if changed
+    if (viewadsb_nic_min != last_sent_nic_min || viewadsb_nacp_min != last_sent_nacp_min) {
+        sendNicNacpClampCommand(con->fd, viewadsb_nic_min, viewadsb_nacp_min);
+        last_sent_nic_min = viewadsb_nic_min;
+        last_sent_nacp_min = viewadsb_nacp_min;
     }
 }
 
@@ -774,9 +845,10 @@ void interactiveShowData(void) {
 
     next_update = now + MODES_INTERACTIVE_REFRESH_TIME;
 
-    // Periodically send ownship to server (viewadsb only)
+    // Periodically send ownship and NIC/NACp clamping to server (viewadsb only)
     if (Modes.viewadsb) {
         interactiveSendOwnship();
+        interactiveSendNicNacp();
     }
 
     // clear potential errors every 2 seconds
@@ -964,6 +1036,34 @@ void interactiveShowData(void) {
                     current_sort_mode = SORT_RSSI;
                     sort_input_active = 0;
                 }
+            } else if (nicnacp_input_active) {
+                // NIC/NACp input mode
+                if (ch == 27) {  // ESC key - cancel input
+                    nicnacp_input_len = 0;
+                    nicnacp_input[0] = '\0';
+                    nicnacp_input_active = 0;
+                } else if (ch == '\n' || ch == '\r') {  // Enter - submit
+                    if (nicnacp_input_len > 0) {
+                        nicnacp_input[nicnacp_input_len] = '\0';
+                        setNicNacpFromInput(nicnacp_input);
+                    } else {
+                        setNicNacpFromInput(NULL);
+                    }
+                    nicnacp_input_len = 0;
+                    nicnacp_input[0] = '\0';
+                    nicnacp_input_active = 0;
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
+                    if (nicnacp_input_len > 0) {
+                        nicnacp_input_len--;
+                        nicnacp_input[nicnacp_input_len] = '\0';
+                    }
+                    if (nicnacp_input_len == 0) {
+                        nicnacp_input_active = 0;
+                    }
+                } else if (((ch >= '0' && ch <= '9') || ch == ',') && nicnacp_input_len < 15) {
+                    nicnacp_input[nicnacp_input_len++] = (char)ch;
+                    nicnacp_input[nicnacp_input_len] = '\0';
+                }
             } else if (ownship_input_active) {
                 // Ownship input mode
                 if (ch == 27) {  // ESC key - cancel input
@@ -999,6 +1099,10 @@ void interactiveShowData(void) {
                     ownship_input_active = 1;
                     ownship_input_len = 0;
                     ownship_input[0] = '\0';
+                } else if (ch == 'n' || ch == 'N') {
+                    nicnacp_input_active = 1;
+                    nicnacp_input_len = 0;
+                    nicnacp_input[0] = '\0';
                 } else if (ch == 's' || ch == 'S') {
                     sort_input_active = 1;
                 } else if (ch == 'q' || ch == 'Q') {
@@ -1031,6 +1135,12 @@ void interactiveShowData(void) {
                 }
             }
             printw(" (ESC=cancel)");
+        } else if (nicnacp_input_active) {
+            // Show NIC/NACp input prompt
+            if (has_colors()) attron(COLOR_PAIR(3));
+            printw("Min NIC,NACp (0-15): %s_", nicnacp_input);
+            if (has_colors()) attroff(COLOR_PAIR(3));
+            printw("  (Enter=set, ESC=cancel)");
         } else if (ownship_input_active) {
             // Show ownship input prompt
             if (has_colors()) attron(COLOR_PAIR(3));
@@ -1045,7 +1155,10 @@ void interactiveShowData(void) {
             } else if (viewadsb_ownship_callsign[0] != '\0') {
                 printw(" Ownship:%s", viewadsb_ownship_callsign);
             }
-            printw("  [o]=ownship [s]=sort [q]=reverse");
+            if (viewadsb_nic_min > 0 || viewadsb_nacp_min > 0) {
+                printw(" NIC/NACp min:%d/%d", viewadsb_nic_min, viewadsb_nacp_min);
+            }
+            printw("  [o]=ownship [n]=NIC/NACp [s]=sort [q]=reverse");
         }
     }
 

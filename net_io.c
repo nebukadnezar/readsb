@@ -400,10 +400,11 @@ static struct client *createSocketClient(struct net_service *service, int fd, ch
     if (epoll_ctl(Modes.net_epfd, EPOLL_CTL_ADD, c->fd, &c->epollEvent))
         perror("epoll_ctl fail:");
 
-    // Send current ownship config to newly connected beast_out clients
+    // Send current config to newly connected beast_out clients
     if (service->writer == &Modes.beast_out) {
         broadcastOwnshipConfig();
         broadcastGain();
+        broadcastNicNacpClampConfig();
     }
 
     return c;
@@ -3922,6 +3923,41 @@ void broadcastEfbRates(void) {
     completeWrite(&Modes.beast_out, p);
 }
 
+// Send NIC/NACp clamping command to readsb server (from viewadsb)
+// Format: 0x1a + N + nic_min (1 byte) + nacp_min (1 byte)
+void sendNicNacpClampCommand(int fd, int nic_min, int nacp_min) {
+    char buf[4];
+    buf[0] = 0x1a;
+    buf[1] = 'N';
+    buf[2] = (char)(nic_min & 0x0F);
+    buf[3] = (char)(nacp_min & 0x0F);
+    anetWrite(fd, buf, 4);
+}
+
+// Broadcast NIC/NACp clamping config to all beast output clients
+void broadcastNicNacpClampConfig(void) {
+    if (!Modes.beast_out.connections) {
+        return;
+    }
+
+    if (Modes.gdl90_nic_min == 0 && Modes.gdl90_nacp_min == 0) {
+        return;  // No clamping configured
+    }
+
+    // Format: 0x1a + N + nic_min + nacp_min
+    char *p = prepareWrite(&Modes.beast_out, 4);
+    if (!p) {
+        return;
+    }
+
+    *p++ = 0x1a;
+    *p++ = 'N';
+    *p++ = (char)(Modes.gdl90_nic_min & 0x0F);
+    *p++ = (char)(Modes.gdl90_nacp_min & 0x0F);
+
+    completeWrite(&Modes.beast_out, p);
+}
+
 // Broadcast current ownship configuration to all beast output clients
 // Called when ownship changes or when a new client connects
 void broadcastOwnshipConfig(void) {
@@ -4221,6 +4257,21 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
         int16_t traffic_rate = (bytes[2] << 8) | bytes[3];
         Modes.received_efb_ownship_rate = ownship_rate / 10.0f;
         Modes.received_efb_traffic_rate = traffic_rate / 10.0f;
+    } else if (p[0] == 'N') {
+        // NIC/NACp clamping command
+        // Format: N + nic_min (1 byte) + nacp_min (1 byte)
+        int nic_min = (uint8_t)p[1] & 0x0F;
+        int nacp_min = (uint8_t)p[2] & 0x0F;
+        Modes.gdl90_nic_min = nic_min;
+        Modes.gdl90_nacp_min = nacp_min;
+        if (!Modes.viewadsb) {
+            if (nic_min > 0 || nacp_min > 0) {
+                fprintf(stderr, "GDL90 NIC/NACp clamping set by client: NIC min=%d, NACp min=%d\n", nic_min, nacp_min);
+            } else {
+                fprintf(stderr, "GDL90 NIC/NACp clamping cleared by client\n");
+            }
+            broadcastNicNacpClampConfig();
+        }
     }
     return 0;
 }
@@ -5152,6 +5203,9 @@ static int readBeastcommand(struct client *c, int64_t now, struct messageBuffer 
         } else if (*p == 'E') { // EFB rates command from readsb
             // Format: E + 4 bytes (2x int16_t rates)
             eom = p + 5;
+        } else if (*p == 'N') { // NIC/NACp clamping command
+            // Format: N + nic_min (1 byte) + nacp_min (1 byte)
+            eom = p + 3;
         } else {
             // Not a valid beast command, skip 0x1a and try again
             ++c->som;
@@ -7570,6 +7624,10 @@ static int gdl90BuildTrafficReport(uint8_t *msg, int size, struct aircraft *a, i
     if (trackDataValid(&a->nac_p_valid) && a->nac_p <= 15) {
         nacp = a->nac_p;
     }
+
+    // Apply minimum clamping for GDL90 output
+    if (nic < Modes.gdl90_nic_min) nic = Modes.gdl90_nic_min;
+    if (nacp < Modes.gdl90_nacp_min) nacp = Modes.gdl90_nacp_min;
 
     msg[13] = ((nic & 0x0F) << 4) | (nacp & 0x0F);
 

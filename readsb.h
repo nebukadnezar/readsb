@@ -998,6 +998,8 @@ struct _Modes
     int64_t gdl90_next_update;      // Next time to send GDL90 traffic data (1Hz)
     int64_t gdl90_ownship_next_update; // Next time to send GDL90 ownship data (5Hz)
     FILE *gdl90_log_file;           // Log file for GDL90 debugging
+    int gdl90_nic_min;              // Minimum NIC value for GDL90 output (0-15, default 0)
+    int gdl90_nacp_min;             // Minimum NACp value for GDL90 output (0-15, default 0)
 
     // EFB rate tracking (for display in viewadsb)
     int efb_ownship_count;          // Ownship messages sent in current period
@@ -1418,6 +1420,8 @@ enum {
     OptGdl90,
     OptGdl90Ip,
     OptGdl90Log,
+    OptGdl90NicMin,
+    OptGdl90NacpMin,
 };
 
 

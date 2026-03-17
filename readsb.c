@@ -1794,6 +1794,22 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             setvbuf(Modes.gdl90_log_file, NULL, _IOLBF, 0);
             fprintf(stderr, "GDL90 logging enabled to %s\n", arg);
             break;
+        case OptGdl90NicMin:
+            Modes.gdl90_nic_min = atoi(arg);
+            if (Modes.gdl90_nic_min < 0 || Modes.gdl90_nic_min > 15) {
+                fprintf(stderr, "Error: --gdl90-nic-min must be 0-15\n");
+                return 1;
+            }
+            fprintf(stderr, "GDL90 minimum NIC set to %d\n", Modes.gdl90_nic_min);
+            break;
+        case OptGdl90NacpMin:
+            Modes.gdl90_nacp_min = atoi(arg);
+            if (Modes.gdl90_nacp_min < 0 || Modes.gdl90_nacp_min > 15) {
+                fprintf(stderr, "Error: --gdl90-nacp-min must be 0-15\n");
+                return 1;
+            }
+            fprintf(stderr, "GDL90 minimum NACp set to %d\n", Modes.gdl90_nacp_min);
+            break;
         case OptDevice:
             Modes.dev_name = strdup(arg);
             break;

@@ -207,9 +207,11 @@ void serviceClose(struct net_service *s);
 
 void sendBeastSettings (int fd, const char *settings);
 void sendOwnshipCommand(int fd, char type, const char *value);
+void sendNicNacpClampCommand(int fd, int nic_min, int nacp_min);
 void broadcastGain(void);
 void broadcastEfbRates(void);
 void broadcastOwnshipConfig(void);
+void broadcastNicNacpClampConfig(void);
 void sendData(struct net_writer *output, char *data, int len);
 
 void modesInitNet (void);
