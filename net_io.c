@@ -57,6 +57,12 @@
 #include <assert.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <linux/sockios.h>
+#endif
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
@@ -101,6 +107,7 @@ static void *pthreadGetaddrinfo(void *param);
 
 static void modesCloseClient(struct client *c);
 static int flushClient(struct client *c, int64_t now);
+static void feedSendHistory(struct client *c);
 static char *read_uuid(struct client *c, char *p, char *eod);
 static void modesReadFromClient(struct client *c, struct messageBuffer *mb);
 
@@ -402,6 +409,7 @@ static struct client *createSocketClient(struct net_service *service, int fd, ch
 
     // Send current config to newly connected beast_out clients
     if (service->writer == &Modes.beast_out) {
+        feedSendHistory(c);
         broadcastOwnshipConfig();
         broadcastGain();
         broadcastNicNacpClampConfig();
@@ -469,7 +477,7 @@ static int suppressConnectError(struct net_connector *con) {
         return 0;
     }
     if (con->fail_counter == failLimit || con->fail_counter % 200 == 0) {
-        fprintf(stderr, "%s: Connection to %s port %s failed %u times, suppressing most error messages until connection succeeds\n",
+        feedEvent("%s: Connection to %s port %s failed %u times, suppressing most error messages until connection succeeds",
                 con->service->descr, con->address, con->port, con->fail_counter);
     }
     return 1;
@@ -500,8 +508,9 @@ static void checkServiceConnected(struct net_connector *con, int64_t now) {
     if (optval != 0) {
         // only 0 means "connection ok"
 
+        snprintf(con->lastErr, sizeof(con->lastErr), "connect failed: %s", strerror(optval));
         if (!suppressConnectError(con)) {
-            fprintf(stderr, "%s: Connection to %s%s port %s failed (%u): %d (%s)\n",
+            feedEvent("%s: Connection to %s%s port %s failed (%u): %d (%s)",
                     con->service->descr, con->address, con->resolved_addr, con->port, con->fail_counter, optval, strerror(optval));
         }
         con->connecting = 0;
@@ -547,15 +556,13 @@ static void checkServiceConnected(struct net_connector *con, int64_t now) {
             return;
         }
     }
-    if (!Modes.interactive) {
-        if (uuid_sent) {
-            fprintf(stderr, "%s: Connection established: %s%s port %s (sent UUID)\n",
-                    con->service->descr, con->address, con->resolved_addr, con->port);
-        } else {
-            fprintf(stderr, "%s: Connection established: %s%s port %s\n",
-                    con->service->descr, con->address, con->resolved_addr, con->port);
-        }
-    }
+    con->reconnects++;
+    con->stateSince = now;
+    con->prevOffered = con->prevQueued = con->prevMsgsQueued = con->prevWire = 0;
+    con->lastErr[0] = '\0';
+    feedEvent("%s: Connection established: %s%s port %s%s",
+            con->service->descr, con->address, con->resolved_addr, con->port,
+            uuid_sent ? " (sent UUID)" : "");
 
     con->fail_counter = 0; // reset fail counter on successful connection
 }
@@ -688,8 +695,9 @@ static void serviceConnect(struct net_connector *con, int64_t now) {
     fd = anetCreateSocket(Modes.aneterr, ai->ai_family, SOCK_NONBLOCK);
 
     if (fd == ANET_ERR) {
+        snprintf(con->lastErr, sizeof(con->lastErr), "socket failed: %s", Modes.aneterr);
         if (!suppressConnectError(con)) {
-            fprintf(stderr, "%s: Connection to %s%s port %s failed: %s\n",
+            feedEvent("%s: Connection to %s%s port %s failed: %s",
                     con->service->descr, con->address, con->resolved_addr, con->port, Modes.aneterr);
         }
         return;
@@ -720,8 +728,9 @@ static void serviceConnect(struct net_connector *con, int64_t now) {
         epoll_ctl(Modes.net_epfd, EPOLL_CTL_DEL, con->fd, &con->dummyClient.epollEvent);
         con->connecting = 0;
         anetCloseSocket(con->fd);
+        snprintf(con->lastErr, sizeof(con->lastErr), "connect failed: %s", strerror(errno));
         if (!suppressConnectError(con)) {
-            fprintf(stderr, "%s: Connection to %s%s port %s failed: %s\n",
+            feedEvent("%s: Connection to %s%s port %s failed: %s",
                     con->service->descr, con->address, con->resolved_addr, con->port, strerror(errno));
         }
     }
@@ -740,8 +749,9 @@ static void serviceReconnectCallback(int64_t now) {
         if (!con->connected) {
             // If we've exceeded our connect timeout, close connection.
             if (con->connecting && now >= con->connect_timeout) {
+                snprintf(con->lastErr, sizeof(con->lastErr), "connect timed out");
                 if (!suppressConnectError(con)) {
-                    fprintf(stderr, "%s: Connection to %s%s port %s timed out.\n",
+                    feedEvent("%s: Connection to %s%s port %s timed out.",
                             con->service->descr, con->address, con->resolved_addr, con->port);
                 }
                 con->connecting = 0;
@@ -762,7 +772,8 @@ static void serviceReconnectCallback(int64_t now) {
                     && now - c->last_read > 2 * Modes.net_heartbeat_interval
                     && c->service->heartbeat_in.msg != NULL
                ) {
-                fprintf(stderr, "%s: No data or heartbeat received for %.0f seconds, reconnecting: %s port %s\n",
+                snprintf(con->lastErr, sizeof(con->lastErr), "no data or heartbeat for %.0f s", (2 * Modes.net_heartbeat_interval) / 1000.0);
+                feedEvent("%s: No data or heartbeat received for %.0f seconds, reconnecting: %s port %s",
                         c->service->descr, (2 * Modes.net_heartbeat_interval) / 1000.0, c->host, c->port);
                 modesCloseClient(c);
             }
@@ -1261,6 +1272,7 @@ static void modesCloseClient(struct client *c) {
         con->connecting = 0;
         con->connected = 0;
         con->c = NULL;
+        con->stateSince = now;
 
         int64_t sinceLastConnect = now - con->lastConnect;
         if (sinceLastConnect > Modes.net_connector_delay) {
@@ -1501,25 +1513,691 @@ static int pongReceived(struct client *c, int64_t now) {
     return 0;
 }
 
-static void dropHalfUntil(int64_t now, struct client *c, int64_t until) {
 
-    if (
-            now > c->dropHalfAntiSpam
+//
+//=========================================================================
+//
+// Feed status: per-connector link health, decoder rates and an event log.
+// readsb collects this once a second (feedStatusUpdate) and broadcasts it to
+// beast output clients (viewadsb) as text records: 0x1a 'F' <text> '\n'
+//   D ...  decoder / receiver summary
+//   C ...  one per net-connector
+//   E ...  one event (also replayed to newly connected clients)
+//
+
+static void *prepareWrite(struct net_writer *writer, int len);
+static void completeWrite(struct net_writer *writer, void *endptr);
+
+// Kernel TCP statistics for a connected socket: smoothed RTT and variance in ms,
+// retransmitted packets, and bytes sitting in the kernel send buffer (sent but
+// unacknowledged plus not yet sent). Returns 0 on success.
+static int tcpLinkInfo(int fd, int *srtt, int *rttvar, int64_t *retrans, int *kernelQueue) {
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+    struct tcp_connection_info ti;
+    socklen_t len = sizeof(ti);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ti, &len) != 0) {
+        return -1;
+    }
+    *srtt = (int) ti.tcpi_srtt;
+    *rttvar = (int) ti.tcpi_rttvar;
+    *retrans = (int64_t) ti.tcpi_txretransmitpackets;
+    *kernelQueue = (int) ti.tcpi_snd_sbbytes;
+    return 0;
+#elif defined(__linux__) && defined(TCP_INFO)
+    struct tcp_info ti;
+    socklen_t len = sizeof(ti);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &len) != 0) {
+        return -1;
+    }
+    *srtt = (int) (ti.tcpi_rtt / 1000);
+    *rttvar = (int) (ti.tcpi_rttvar / 1000);
+    *retrans = (int64_t) ti.tcpi_total_retrans;
+    int outq = 0;
+    if (ioctl(fd, SIOCOUTQ, &outq) != 0) {
+        outq = -1;
+    }
+    *kernelQueue = outq;
+    return 0;
+#else
+    MODES_NOTUSED(fd);
+    MODES_NOTUSED(srtt);
+    MODES_NOTUSED(rttvar);
+    MODES_NOTUSED(retrans);
+    MODES_NOTUSED(kernelQueue);
+    return -1;
+#endif
+}
+
+// copy text into a beast 'F' record, replacing bytes that would break framing
+static char *feedCopyRecord(char *p, const char *text) {
+    *p++ = 0x1a;
+    *p++ = 'F';
+    for (const char *t = text; *t; t++) {
+        char ch = *t;
+        if (ch == 0x1a || ch == '\n' || ch == '\r') {
+            ch = ' ';
+        }
+        *p++ = ch;
+    }
+    *p++ = '\n';
+    return p;
+}
+
+// Send one status record to all beast output clients (viewadsb)
+static void feedSendRecord(const char *text) {
+    if (!Modes.beast_out.connections) {
+        return;
+    }
+    int len = strlen(text) + 3;
+    char *p = prepareWrite(&Modes.beast_out, len);
+    if (!p) {
+        return;
+    }
+    p = feedCopyRecord(p, text);
+    completeWrite(&Modes.beast_out, p);
+}
+
+static void feedEventAdd(int64_t now, const char *msg) {
+    struct feedStatus *fs = &Modes.feed;
+    struct feedEvent *e = &fs->events[fs->eventHead];
+    e->time = now;
+    strncpy(e->msg, msg, FEED_EVENT_LEN - 1);
+    e->msg[FEED_EVENT_LEN - 1] = '\0';
+    fs->eventHead = (fs->eventHead + 1) % FEED_EVENTS_MAX;
+    if (fs->eventCount < FEED_EVENTS_MAX) {
+        fs->eventCount++;
+    }
+    fs->eventSeq++;
+}
+
+static void feedFormatEvent(char *rec, int recLen, uint64_t seq, int64_t time, const char *msg) {
+    snprintf(rec, recLen, "E s=%llu t=%lld m=%s", (unsigned long long) seq, (long long) time, msg);
+}
+
+// Log a network / feed related event: timestamped on stderr, kept in the event
+// ring for the status page, written to --feed-log and pushed to viewadsb.
+void feedEvent(const char *format, ...) {
+    char msg[FEED_EVENT_LEN];
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(msg, sizeof(msg), format, ap);
+    va_end(ap);
+    msg[sizeof(msg) - 1] = '\0';
+
+    int64_t now = mstime();
+
+    if (!Modes.interactive) {
+        printTimestamp(stderr, now);
+        fprintf(stderr, "%s\n", msg);
+    }
+
+    feedEventAdd(now, msg);
+
+    if (Modes.feed.logFile) {
+        // quote the message, it may contain commas
+        fprintf(Modes.feed.logFile, "E,%lld,\"", (long long) now);
+        for (char *t = msg; *t; t++) {
+            fputc(*t == '"' ? '\'' : *t, Modes.feed.logFile);
+        }
+        fprintf(Modes.feed.logFile, "\"\n");
+    }
+
+    char rec[FEED_EVENT_LEN + 64];
+    feedFormatEvent(rec, sizeof(rec), Modes.feed.eventSeq, now, msg);
+    feedSendRecord(rec);
+}
+
+// Replay recent events to a newly connected beast output client so its
+// event log isn't empty. Only as many as fit in the send queue, newest preferred.
+static void feedSendHistory(struct client *c) {
+    struct feedStatus *fs = &Modes.feed;
+    if (!c->sendq || fs->eventCount == 0) {
+        return;
+    }
+    int room = c->sendq_max - c->sendq_len - 256;
+    int count = 0;
+    // walk backwards from the newest event to see how many fit
+    for (int i = 1; i <= fs->eventCount; i++) {
+        struct feedEvent *e = &fs->events[(fs->eventHead - i + FEED_EVENTS_MAX) % FEED_EVENTS_MAX];
+        int len = strlen(e->msg) + 64;
+        if (len > room) {
+            break;
+        }
+        room -= len;
+        count = i;
+    }
+    for (int i = count; i >= 1; i--) {
+        struct feedEvent *e = &fs->events[(fs->eventHead - i + FEED_EVENTS_MAX) % FEED_EVENTS_MAX];
+        uint64_t seq = fs->eventSeq - i + 1;
+        char rec[FEED_EVENT_LEN + 64];
+        feedFormatEvent(rec, sizeof(rec), seq, e->time, e->msg);
+        if (c->sendq_len + (int) strlen(rec) + 3 >= c->sendq_max) {
+            break;
+        }
+        char *p = feedCopyRecord(c->sendq + c->sendq_len, rec);
+        c->sendq_len = p - c->sendq;
+    }
+}
+
+
+// ---- ICMP echo to feed hosts ----
+// TCP round trip times are meaningless behind the TCP accelerating proxies used
+// on satellite links (they acknowledge locally), so send a real echo request to
+// the feed host once a second and measure the reply.
+#define FEED_ICMP_MAGIC 0x52534246u
+struct feedIcmpEcho {
+    uint8_t type;
+    uint8_t code;
+    uint16_t cksum;
+    uint16_t id;
+    uint16_t seq;
+    uint32_t magic;
+    uint32_t index;
+    int64_t sent;
+} __attribute__((packed));
+
+static int feedIcmpFd = -2; // -2 not initialised, -1 unavailable
+static uint16_t feedIcmpIdent;
+
+static uint16_t feedIcmpChecksum(const void *data, int len) {
+    const uint8_t *b = data;
+    uint32_t sum = 0;
+    for (int i = 0; i + 1 < len; i += 2) {
+        sum += (uint32_t) ((b[i] << 8) | b[i + 1]);
+    }
+    if (len & 1) {
+        sum += (uint32_t) (b[len - 1] << 8);
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return htons((uint16_t) ~sum);
+}
+
+static void feedIcmpInit(void) {
+    feedIcmpFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    int dgram = 1;
+    if (feedIcmpFd < 0) {
+        feedIcmpFd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        dgram = 0;
+    }
+    if (feedIcmpFd < 0) {
+        feedIcmpFd = -1;
+        feedEvent("Feed status: ICMP ping unavailable (%s), Ping column disabled", strerror(errno));
+        return;
+    }
+    fcntl(feedIcmpFd, F_SETFL, fcntl(feedIcmpFd, F_GETFL, 0) | O_NONBLOCK);
+    int one = 1;
+    setsockopt(feedIcmpFd, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one));
+    feedIcmpIdent = (uint16_t) (getpid() & 0xffff);
+#ifdef __linux__
+    if (dgram) {
+        // linux rewrites the echo identifier with the socket's local "port"
+        struct sockaddr_in sa;
+        socklen_t len = sizeof(sa);
+        if (getsockname(feedIcmpFd, (struct sockaddr *) &sa, &len) == 0) {
+            feedIcmpIdent = ntohs(sa.sin_port);
+        }
+    }
+#else
+    MODES_NOTUSED(dgram);
+#endif
+}
+
+static void feedIcmpSend(struct net_connector *con, int index, int64_t now) {
+    if (feedIcmpFd < 0 || !con->pingAddrValid) {
+        return;
+    }
+    struct feedIcmpEcho e;
+    memset(&e, 0, sizeof(e));
+    e.type = 8; // echo request
+    e.code = 0;
+    e.id = htons(feedIcmpIdent);
+    e.seq = htons(con->pingSeq++);
+    e.magic = FEED_ICMP_MAGIC;
+    e.index = (uint32_t) index;
+    e.sent = mstime(); // fresh: 'now' may predate the epoll wait in this loop iteration
+    MODES_NOTUSED(now);
+    e.cksum = feedIcmpChecksum(&e, sizeof(e));
+    if (sendto(feedIcmpFd, &e, sizeof(e), 0, (struct sockaddr *) &con->pingAddr, sizeof(con->pingAddr)) == (ssize_t) sizeof(e)) {
+        con->ringPingSent[con->ringIdx]++;
+    }
+}
+
+static void feedIcmpPoll(int64_t now) {
+    if (feedIcmpFd < 0) {
+        return;
+    }
+    for (int k = 0; k < 64; k++) {
+        uint8_t buf[1500];
+        uint8_t cbuf[128];
+        struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf;
+        msg.msg_controllen = sizeof(cbuf);
+        ssize_t n = recvmsg(feedIcmpFd, &msg, MSG_DONTWAIT);
+        if (n <= 0) {
+            break;
+        }
+        int64_t rxTime = now;
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMP) {
+                struct timeval tv;
+                memcpy(&tv, CMSG_DATA(cm), sizeof(tv));
+                rxTime = (int64_t) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            }
+        }
+        int off = 0;
+        if (n >= 20 && (buf[0] >> 4) == 4) {
+            off = (buf[0] & 0x0f) * 4; // macOS / raw sockets deliver the IP header too
+        }
+        if (n - off < (ssize_t) sizeof(struct feedIcmpEcho)) {
+            continue;
+        }
+        struct feedIcmpEcho e;
+        memcpy(&e, buf + off, sizeof(e));
+        if (e.type != 0 || e.magic != FEED_ICMP_MAGIC || ntohs(e.id) != feedIcmpIdent) {
+            continue; // not an echo reply, or somebody else's
+        }
+        if (e.index >= (uint32_t) Modes.net_connectors_count) {
+            continue;
+        }
+        struct net_connector *con = &Modes.net_connectors[e.index];
+        int64_t rtt = rxTime - e.sent;
+        if (rtt < 0) {
+            rtt = 0;
+        }
+        con->pingRttLast = (int) rtt;
+        con->pingRttAvg = con->pingRttAvg > 0 ? con->pingRttAvg * 0.7 + rtt * 0.3 : (double) rtt;
+        con->pingLastReply = now;
+        con->ringPingRecv[con->ringIdx]++;
+    }
+}
+
+static void feedConnectorInitStatus(struct net_connector *con, int64_t now) {
+    if (con->stateSince == 0) {
+        con->stateSince = now;
+    }
+}
+
+static void feedUpdateConnector(struct net_connector *con, struct feedConnStatus *st, int64_t now, int64_t elapsed) {
+    struct client *c = con->connected ? con->c : NULL;
+
+    feedConnectorInitStatus(con, now);
+
+    strncpy(st->name, con->address ? con->address : "?", FEED_NAME_LEN - 1);
+    st->name[FEED_NAME_LEN - 1] = '\0';
+    strncpy(st->port, con->port ? con->port : "?", sizeof(st->port) - 1);
+    st->port[sizeof(st->port) - 1] = '\0';
+    strncpy(st->protocol, con->protocol ? con->protocol : "?", sizeof(st->protocol) - 1);
+    st->protocol[sizeof(st->protocol) - 1] = '\0';
+    strncpy(st->lastErr, con->lastErr, FEED_NAME_LEN - 1);
+    st->lastErr[FEED_NAME_LEN - 1] = '\0';
+
+    st->state = c ? 2 : (con->connecting ? 1 : 0);
+    st->sinceSec = (now - con->stateSince) / 1000;
+    st->reconnects = con->reconnects;
+
+    if (con->lastOutageCheck && !c) {
+        con->outageMs += now - con->lastOutageCheck;
+    }
+    con->lastOutageCheck = now;
+    st->outageSec = con->outageMs / 1000;
+
+    int input = (con->service && con->service->group == &Modes.services_in);
+    uint64_t offered = 0, queued = 0, msgs = 0, wire = 0;
+
+    if (c) {
+        if (input) {
+            // input connection: what we receive from the remote side
+            offered = c->bytesReceived - con->prevOffered;
+            queued = offered;
+            wire = offered;
+            msgs = c->messageCounter - con->prevMsgsQueued;
+            con->prevOffered = c->bytesReceived;
+            con->prevMsgsQueued = c->messageCounter;
+        } else {
+            offered = c->bytesFromWriter - con->prevOffered;
+            queued = c->bytesSent - con->prevQueued;
+            msgs = c->msgsQueued - con->prevMsgsQueued;
+            wire = c->bytesWire - con->prevWire;
+            con->prevOffered = c->bytesFromWriter;
+            con->prevQueued = c->bytesSent;
+            con->prevMsgsQueued = c->msgsQueued;
+            con->prevWire = c->bytesWire;
+        }
+        st->dropActive = c->dropActive;
+        st->sendqPct = c->sendq_max ? (int) (100 * (int64_t) c->sendq_len / c->sendq_max) : 0;
+
+        int srtt, rttvar, unacked;
+        int64_t retrans;
+        if (tcpLinkInfo(c->fd, &srtt, &rttvar, &retrans, &unacked) == 0) {
+            st->rtt = srtt;
+            st->rttVar = rttvar;
+            st->retrans = retrans;
+            st->unacked = unacked;
+        } else {
+            st->rtt = -1;
+            st->rttVar = -1;
+            st->retrans = -1;
+            st->unacked = -1;
+        }
+    } else {
+        st->dropActive = 0;
+        st->sendqPct = 0;
+        st->rtt = -1;
+        st->rttVar = -1;
+        st->retrans = -1;
+        st->unacked = -1;
+    }
+
+    con->totalOffered += offered;
+    con->totalQueued += queued;
+    con->totalMsgsQueued += msgs;
+
+    con->ringOffered[con->ringIdx] = (uint32_t) offered;
+    con->ringQueued[con->ringIdx] = (uint32_t) queued;
+    con->ringIdx = (con->ringIdx + 1) % 60;
+    con->ringPingSent[con->ringIdx] = 0;
+    con->ringPingRecv[con->ringIdx] = 0;
+
+    uint64_t sumO = 0, sumQ = 0, pingSent = 0, pingRecv = 0;
+    for (int i = 0; i < 60; i++) {
+        sumO += con->ringOffered[i];
+        sumQ += con->ringQueued[i];
+        pingRecv += con->ringPingRecv[i];
+        // replies for the last two echoes may still be in flight, don't count those as lost
+        int age = (con->ringIdx - i + 60) % 60;
+        if (age >= 2) {
+            pingSent += con->ringPingSent[i];
+        }
+    }
+
+    // ICMP echo target: the peer address while connected, the address being tried otherwise
+    if (c) {
+        struct sockaddr_storage ss;
+        socklen_t len = sizeof(ss);
+        if (getpeername(c->fd, (struct sockaddr *) &ss, &len) == 0 && ss.ss_family == AF_INET) {
+            memcpy(&con->pingAddr, &ss, sizeof(con->pingAddr));
+            con->pingAddrValid = 1;
+        }
+    } else if (con->try_addr && con->try_addr->ai_family == AF_INET && con->try_addr->ai_addrlen >= sizeof(struct sockaddr_in)) {
+        memcpy(&con->pingAddr, con->try_addr->ai_addr, sizeof(con->pingAddr));
+        con->pingAddrValid = 1;
+    }
+    feedIcmpSend(con, (int) (con - Modes.net_connectors), now);
+
+    if (con->pingRttAvg > 0 && now - con->pingLastReply < 30 * SECONDS) {
+        st->ping = (int) (con->pingRttAvg + 0.5);
+    } else {
+        st->ping = -1;
+    }
+    if (pingSent > 0) {
+        int loss = (int) (100 - 100 * pingRecv / pingSent);
+        st->pingLoss = loss < 0 ? 0 : (loss > 100 ? 100 : loss);
+    } else {
+        st->pingLoss = -1;
+    }
+
+    st->msgRate = msgs * 1000.0 / elapsed;
+    st->byteRate = wire * 1000.0 / elapsed;
+    st->msgsSent = con->totalMsgsQueued;
+    st->loss1m = sumO ? 100.0 - 100.0 * (double) sumQ / (double) sumO : 0.0;
+    st->lossTotal = con->totalOffered ? 100.0 - 100.0 * (double) con->totalQueued / (double) con->totalOffered : 0.0;
+    if (input) {
+        st->loss1m = -1;
+        st->lossTotal = -1;
+    }
+}
+
+// end a drop episode once the link has been clean for a while
+static void feedCheckDropEnd(struct client *c, int64_t now) {
+    if (!c->dropActive || now < c->dropHalfUntil + 10 * SECONDS) {
+        return;
+    }
+    c->dropActive = 0;
+    uint64_t offered = c->bytesFromWriter - c->dropStartOffered;
+    uint64_t queued = c->bytesSent - c->dropStartQueued;
+    double lost = offered ? 100.0 - 100.0 * (double) queued / (double) offered : 0.0;
+    feedEvent("%s: %s port %s: link recovered, lost %.1f%% of data over %.0f s",
+            c->service->descr, c->host, c->port, lost, (now - c->dropStart) / 1000.0);
+}
+
+static void feedCheckDropEndGroup(struct net_service_group *group, int64_t now) {
+    for (int i = 0; i < group->len; i++) {
+        struct net_service *service = &group->services[i];
+        if (!service->writer) {
+            continue;
+        }
+        for (struct client *c = service->clients; c; c = c->next) {
+            if (!c->service || c->acceptSocket || c->net_connector_dummyClient) {
+                continue;
+            }
+            feedCheckDropEnd(c, now);
+        }
+    }
+}
+
+static void feedWriteLog(struct feedStatus *fs, int64_t now) {
+    FILE *f = fs->logFile;
+    if (!f) {
+        return;
+    }
+    fprintf(f, "D,%lld,%.1f,%.1f,%d,%d,%.0f,%d\n", (long long) now,
+            fs->msgRate, fs->posRate, fs->aircraft, fs->gain, fs->samplesLostRate, fs->gdl90Connected);
+    for (int i = 0; i < fs->connCount; i++) {
+        struct feedConnStatus *st = &fs->conn[i];
+        fprintf(f, "S,%lld,%s,%s,%d,%d,%lld,%.1f,%.0f,%llu,%.1f,%.1f,%d,%d,%d,%d,%lld,%d,%d,%d,%lld\n",
+                (long long) now, st->name, st->port, st->state, st->dropActive, (long long) st->sinceSec,
+                st->msgRate, st->byteRate, (unsigned long long) st->msgsSent, st->loss1m, st->lossTotal,
+                st->ping, st->pingLoss,
+                st->rtt, st->rttVar, (long long) st->retrans, st->unacked, st->sendqPct, st->reconnects,
+                (long long) st->outageSec);
+    }
+}
+
+static void feedBroadcast(struct feedStatus *fs, int64_t now) {
+    if (!Modes.beast_out.connections) {
+        return;
+    }
+    char rec[512];
+    snprintf(rec, sizeof(rec), "D t=%lld m=%.1f p=%.1f a=%d g=%d sl=%.0f up=%lld e=%d nc=%d",
+            (long long) now, fs->msgRate, fs->posRate, fs->aircraft, fs->gain, fs->samplesLostRate,
+            (long long) fs->uptimeSec, fs->gdl90Connected, fs->connCount);
+    feedSendRecord(rec);
+    for (int i = 0; i < fs->connCount; i++) {
+        struct feedConnStatus *st = &fs->conn[i];
+        snprintf(rec, sizeof(rec),
+                "C i=%d n=%s p=%s pr=%s st=%d dr=%d si=%lld mr=%.1f br=%.0f ms=%llu l1=%.1f lt=%.1f pg=%d pl=%d rtt=%d rv=%d rx=%lld ua=%d sq=%d rc=%d out=%lld err=%s",
+                i, st->name, st->port, st->protocol, st->state, st->dropActive, (long long) st->sinceSec,
+                st->msgRate, st->byteRate, (unsigned long long) st->msgsSent, st->loss1m, st->lossTotal,
+                st->ping, st->pingLoss,
+                st->rtt, st->rttVar, (long long) st->retrans, st->unacked, st->sendqPct, st->reconnects,
+                (long long) st->outageSec, st->lastErr);
+        feedSendRecord(rec);
+    }
+}
+
+// called once a second from backgroundTasks (decode mutex held)
+void feedStatusUpdate(int64_t now) {
+    if (Modes.viewadsb) {
+        // viewadsb displays what readsb sends, it doesn't collect its own
+        return;
+    }
+    struct feedStatus *fs = &Modes.feed;
+    int64_t elapsed = fs->prevUpdate ? now - fs->prevUpdate : 1000;
+    if (elapsed <= 0) {
+        elapsed = 1;
+    }
+    if (feedIcmpFd == -2 && Modes.net_connectors_count > 0) {
+        feedIcmpInit();
+    }
+    feedIcmpPoll(now);
+
+    // decoder
+    fs->msgRate = (fs->msgsDecoded - fs->prevMsgsDecoded) * 1000.0 / elapsed;
+    fs->prevMsgsDecoded = fs->msgsDecoded;
+    // positions: cpr_decoded is set by the track update which runs after netUseMessage,
+    // so use the CPR statistics counters (alltime + current is monotonic)
+    uint64_t pos = (uint64_t) Modes.stats_alltime.cpr_global_ok + Modes.stats_alltime.cpr_local_ok
+        + Modes.stats_current.cpr_global_ok + Modes.stats_current.cpr_local_ok;
+    fs->posRate = pos >= fs->prevPosDecoded ? (pos - fs->prevPosDecoded) * 1000.0 / elapsed : 0;
+    fs->prevPosDecoded = pos;
+
+    uint64_t lost = Modes.stats_alltime.samples_lost + Modes.stats_alltime.samples_dropped
+        + Modes.stats_current.samples_lost + Modes.stats_current.samples_dropped;
+    fs->samplesLostRate = lost >= fs->prevSamplesLost ? (lost - fs->prevSamplesLost) * 1000.0 / elapsed : 0;
+    fs->prevSamplesLost = lost;
+
+    int count = 0;
+    struct craftArray *ca = &Modes.aircraftActive;
+    ca_lock_read(ca);
+    for (int i = 0; i < ca->len; i++) {
+        struct aircraft *a = ca->list[i];
+        if (a && a->messages > 1 && now - a->seen < 60 * SECONDS) {
+            count++;
+        }
+    }
+    ca_unlock_read(ca);
+    fs->aircraft = count;
+    fs->gain = Modes.gain;
+    fs->uptimeSec = getUptime() / 1000;
+    fs->gdl90Connected = Modes.gdl90_target_valid;
+
+    // connectors
+    fs->connCount = imin(Modes.net_connectors_count, FEED_CONN_MAX);
+    for (int i = 0; i < fs->connCount; i++) {
+        feedUpdateConnector(&Modes.net_connectors[i], &fs->conn[i], now, elapsed);
+    }
+
+    feedCheckDropEndGroup(&Modes.services_out, now);
+    feedCheckDropEndGroup(&Modes.services_in, now);
+
+    fs->updated = now;
+    fs->prevUpdate = now;
+
+    feedWriteLog(fs, now);
+    feedBroadcast(fs, now);
+}
+
+// viewadsb side: parse a status record received from readsb into Modes.feed
+static void feedParseRecord(char *text) {
+    struct feedStatus *fs = &Modes.feed;
+    char type = text[0];
+    if (type != 'D' && type != 'C' && type != 'E') {
+        return;
+    }
+    if (text[1] != ' ' && text[1] != '\0') {
+        return;
+    }
+    char *p = text + 1;
+    struct feedConnStatus *st = NULL;
+    uint64_t seq = 0;
+    int64_t etime = 0;
+    const char *emsg = NULL;
+
+    while (*p) {
+        while (*p == ' ') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        char *key = p;
+        char *eq = strchr(p, '=');
+        if (!eq) {
+            break;
+        }
+        *eq = '\0';
+        char *val = eq + 1;
+        char *end;
+        int lastField = (type == 'E' && strcmp(key, "m") == 0) || (type == 'C' && strcmp(key, "err") == 0);
+        if (lastField) {
+            end = val + strlen(val);
+        } else {
+            end = strchr(val, ' ');
+            if (!end) {
+                end = val + strlen(val);
+            }
+        }
+        int more = (*end == ' ');
+        *end = '\0';
+
+        if (type == 'D') {
+            if (!strcmp(key, "t")) fs->updated = strtoll(val, NULL, 10);
+            else if (!strcmp(key, "m")) fs->msgRate = atof(val);
+            else if (!strcmp(key, "p")) fs->posRate = atof(val);
+            else if (!strcmp(key, "a")) fs->aircraft = atoi(val);
+            else if (!strcmp(key, "g")) fs->gain = atoi(val);
+            else if (!strcmp(key, "sl")) fs->samplesLostRate = atof(val);
+            else if (!strcmp(key, "up")) fs->uptimeSec = strtoll(val, NULL, 10);
+            else if (!strcmp(key, "e")) fs->gdl90Connected = atoi(val);
+            else if (!strcmp(key, "nc")) fs->connCount = imin(imax(atoi(val), 0), FEED_CONN_MAX);
+        } else if (type == 'C') {
+            if (!strcmp(key, "i")) {
+                int idx = atoi(val);
+                st = (idx >= 0 && idx < FEED_CONN_MAX) ? &fs->conn[idx] : NULL;
+            } else if (st) {
+                if (!strcmp(key, "n")) { strncpy(st->name, val, FEED_NAME_LEN - 1); st->name[FEED_NAME_LEN - 1] = '\0'; }
+                else if (!strcmp(key, "p")) { strncpy(st->port, val, sizeof(st->port) - 1); st->port[sizeof(st->port) - 1] = '\0'; }
+                else if (!strcmp(key, "pr")) { strncpy(st->protocol, val, sizeof(st->protocol) - 1); st->protocol[sizeof(st->protocol) - 1] = '\0'; }
+                else if (!strcmp(key, "st")) st->state = atoi(val);
+                else if (!strcmp(key, "dr")) st->dropActive = atoi(val);
+                else if (!strcmp(key, "si")) st->sinceSec = strtoll(val, NULL, 10);
+                else if (!strcmp(key, "mr")) st->msgRate = atof(val);
+                else if (!strcmp(key, "br")) st->byteRate = atof(val);
+                else if (!strcmp(key, "ms")) st->msgsSent = strtoull(val, NULL, 10);
+                else if (!strcmp(key, "l1")) st->loss1m = atof(val);
+                else if (!strcmp(key, "lt")) st->lossTotal = atof(val);
+                else if (!strcmp(key, "pg")) st->ping = atoi(val);
+                else if (!strcmp(key, "pl")) st->pingLoss = atoi(val);
+                else if (!strcmp(key, "rtt")) st->rtt = atoi(val);
+                else if (!strcmp(key, "rv")) st->rttVar = atoi(val);
+                else if (!strcmp(key, "rx")) st->retrans = strtoll(val, NULL, 10);
+                else if (!strcmp(key, "ua")) st->unacked = atoi(val);
+                else if (!strcmp(key, "sq")) st->sendqPct = atoi(val);
+                else if (!strcmp(key, "rc")) st->reconnects = atoi(val);
+                else if (!strcmp(key, "out")) st->outageSec = strtoll(val, NULL, 10);
+                else if (!strcmp(key, "err")) { strncpy(st->lastErr, val, FEED_NAME_LEN - 1); st->lastErr[FEED_NAME_LEN - 1] = '\0'; }
+            }
+        } else if (type == 'E') {
+            if (!strcmp(key, "s")) seq = strtoull(val, NULL, 10);
+            else if (!strcmp(key, "t")) etime = strtoll(val, NULL, 10);
+            else if (!strcmp(key, "m")) emsg = val;
+        }
+
+        p = more ? end + 1 : end;
+    }
+
+    if (type == 'E' && emsg) {
+        // ignore replayed events we already have (same readsb instance); a restarted
+        // readsb starts its sequence over but its events are newer
+        int64_t lastTime = fs->eventCount ? fs->events[(fs->eventHead - 1 + FEED_EVENTS_MAX) % FEED_EVENTS_MAX].time : 0;
+        if (seq <= fs->eventSeq && etime <= lastTime) {
+            return;
+        }
+        feedEventAdd(etime, emsg);
+        fs->eventSeq = seq;
+    }
+}
+
+static void dropHalfUntil(int64_t now, struct client *c, int64_t until, const char *reason) {
+
+    // log the start of a drop episode; the end is logged by feedCheckDropEnd
+    // once the link has been clean for a while. Ignore the first seconds after
+    // connecting, the initial burst regularly overflows the send queue.
+    if (!c->dropActive
             && (now - c->connectedSince > 10 * SECONDS || Modes.debug_net || Modes.debug_flush)
        ) {
-        int suppress;
-        if (Modes.debug_flush) {
-            suppress = 2;
-        } else if (Modes.debug_net) {
-            suppress = 10;
-        } else {
-            suppress = 300;
-        }
-        c->dropHalfAntiSpam = now + suppress * SECONDS;
-        double lostPercent = 100.0 - (double) c->bytesSent / (double) c->bytesFromWriter * 100.0;
-        fprintf(stderr, "%s: %s port %s: Bad connection, dropping data"
-                " (connection lost %4.1f%% of data) (suppress msg for %d s)\n",
-                c->service->descr, c->host, c->port, lostPercent, suppress);
+        c->dropActive = 1;
+        c->dropStart = now;
+        c->dropStartOffered = c->bytesFromWriter;
+        c->dropStartQueued = c->bytesSent;
+        feedEvent("%s: %s port %s: link congested (%s), dropping data",
+                c->service->descr, c->host, c->port, reason);
     }
     c->dropHalfUntil = until;
     c->dropHalfDrop = 1;
@@ -1539,15 +2217,22 @@ static int flushClient(struct client *c, int64_t now) {
     // If we get -1, it's only fatal if it's not EAGAIN/EWOULDBLOCK
     if (bytesWritten < 0) {
         if (err != EAGAIN && err != EWOULDBLOCK) {
-            fprintf(stderr, "%s: Send Error: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
-                    c->service->descr, strerror(err), c->host, c->port,
-                    c->fd, c->sendq_len, c->buflen);
+            if (c->con) {
+                snprintf(c->con->lastErr, sizeof(c->con->lastErr), "send error: %s", strerror(err));
+                feedEvent("%s: Send Error: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)",
+                        c->service->descr, strerror(err), c->host, c->port,
+                        c->fd, c->sendq_len, c->buflen);
+            } else {
+                fprintf(stderr, "%s: Send Error: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
+                        c->service->descr, strerror(err), c->host, c->port,
+                        c->fd, c->sendq_len, c->buflen);
+            }
             modesCloseClient(c);
             return -1;
         }
     }
     if (bytesWritten < toWrite) {
-        dropHalfUntil(now, c, now + 2 * SECONDS);
+        dropHalfUntil(now, c, now + 2 * SECONDS, "partial send");
     }
     if (bytesWritten > toWrite) {
         fprintf(stderr, "%s: send() weirdness: bytesWritten > toWrite: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
@@ -1561,6 +2246,7 @@ static int flushClient(struct client *c, int64_t now) {
         fprintf(stderr, " %s: send wrote: %d/%d bytes (%s port %s fd %d, SendQ %d)\n", c->service->descr, bytesWritten, toWrite, c->host, c->port, c->fd, c->sendq_len);
     }
     if (bytesWritten > 0) {
+        c->bytesWire += bytesWritten;
         Modes.stats_current.network_bytes_out += bytesWritten;
         // Advance buffer
         toWrite -= bytesWritten;
@@ -1587,7 +2273,12 @@ static int flushClient(struct client *c, int64_t now) {
     // if we haven't been able to send any data on this connection for 2 seconds, drop it
     int64_t sendTimeout = 5 * SECONDS;
     if (now - c->last_send > sendTimeout && now - c->connectedSince > 15 * SECONDS) {
-        fprintf(stderr, "%s: Couldn't send any data for %.2fs (Insufficient bandwidth?): disconnecting: %s port %s (fd %d, SendQ %d)\n", c->service->descr, sendTimeout / 1000.0, c->host, c->port, c->fd, c->sendq_len);
+        if (c->con) {
+            snprintf(c->con->lastErr, sizeof(c->con->lastErr), "no data sent for %.0f s", sendTimeout / 1000.0);
+            feedEvent("%s: Couldn't send any data for %.2fs (Insufficient bandwidth?): disconnecting: %s port %s (fd %d, SendQ %d)", c->service->descr, sendTimeout / 1000.0, c->host, c->port, c->fd, c->sendq_len);
+        } else {
+            fprintf(stderr, "%s: Couldn't send any data for %.2fs (Insufficient bandwidth?): disconnecting: %s port %s (fd %d, SendQ %d)\n", c->service->descr, sendTimeout / 1000.0, c->host, c->port, c->fd, c->sendq_len);
+        }
         modesCloseClient(c);
         return -1;
     }
@@ -1623,11 +2314,12 @@ static void flushWrites(struct net_writer *writer) {
             }
 
             c->bytesFromWriter += writer->dataUsed;
+            c->msgsOffered += writer->msgsPending;
 
             int bufferInsufficient = (c->sendq_len + writer->dataUsed > c->sendq_max);
 
             if (bufferInsufficient) {
-                dropHalfUntil(now, c, now + 2 * SECONDS);
+                dropHalfUntil(now, c, now + 2 * SECONDS, "send queue full");
             }
 
             if ((c->dropHalfUntil > now && c->dropHalfDrop) || bufferInsufficient) {
@@ -1637,6 +2329,7 @@ static void flushWrites(struct net_writer *writer) {
                 memcpy(c->sendq + c->sendq_len, writer->data, writer->dataUsed);
                 c->sendq_len += writer->dataUsed;
                 c->bytesSent += writer->dataUsed;
+                c->msgsQueued += writer->msgsPending;
 
                 if (0) {
                     double lostPercent = 100.0 - (double) c->bytesSent / (double) c->bytesFromWriter * 100.0;
@@ -1659,6 +2352,7 @@ static void flushWrites(struct net_writer *writer) {
     }
     writer->lastReceiverId = 0; // unconditionally emit receiver id on start of new "packet"
     writer->dataUsed = 0;
+    writer->msgsPending = 0;
     writer->lastWrite = now;
     return;
 }
@@ -1800,6 +2494,7 @@ static void modesSendBeastOutput(struct modesMessage *mm, struct net_writer *wri
         }
     }
 
+    writer->msgsPending++;
     completeWrite(writer, p);
 }
 
@@ -4178,7 +4873,7 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
     } else if (p[0] == 'W') {
         switch (p[1]) {
             case 'S':
-                dropHalfUntil(now, c, now + PING_REDUCE_DURATION);
+                dropHalfUntil(now, c, now + PING_REDUCE_DURATION, "server requested slowdown");
                 break;
         }
     } else if (p[0] == 'O') {
@@ -4197,7 +4892,7 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                     if (i > 0) {
                         Modes.ownship_hex = (uint32_t)strtol(hexstr, NULL, 16);
                         Modes.ownship_callsign[0] = '\0';
-                        fprintf(stderr, "Ownship set by client to hex: %06X\n", Modes.ownship_hex);
+                        feedEvent("Ownship set by client to hex: %06X", Modes.ownship_hex);
                         broadcastOwnshipConfig();  // Notify other clients
                     }
                 }
@@ -4219,7 +4914,7 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                         Modes.ownship_hex = 0;
                         strncpy(Modes.ownship_callsign, callsign, 8);
                         Modes.ownship_callsign[8] = '\0';
-                        fprintf(stderr, "Ownship set by client to callsign: %s\n", Modes.ownship_callsign);
+                        feedEvent("Ownship set by client to callsign: %s", Modes.ownship_callsign);
                         broadcastOwnshipConfig();  // Notify other clients
                     }
                 }
@@ -4228,7 +4923,7 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
                 // Clear ownship
                 Modes.ownship_hex = 0;
                 Modes.ownship_callsign[0] = '\0';
-                fprintf(stderr, "Ownship cleared by client\n");
+                feedEvent("Ownship cleared by client");
                 broadcastOwnshipConfig();  // Notify other clients (sends nothing since cleared)
                 break;
         }
@@ -4266,9 +4961,9 @@ static int handleBeastCommand(struct client *c, char *p, int remote, int64_t now
         Modes.gdl90_nacp_min = nacp_min;
         if (!Modes.viewadsb) {
             if (nic_min > 0 || nacp_min > 0) {
-                fprintf(stderr, "GDL90 NIC/NACp clamping set by client: NIC min=%d, NACp min=%d\n", nic_min, nacp_min);
+                feedEvent("GDL90 NIC/NACp clamping set by client: NIC min=%d, NACp min=%d", nic_min, nacp_min);
             } else {
-                fprintf(stderr, "GDL90 NIC/NACp clamping cleared by client\n");
+                feedEvent("GDL90 NIC/NACp clamping cleared by client");
             }
             broadcastNicNacpClampConfig();
         }
@@ -5076,7 +5771,12 @@ static int readClient(struct client *c, int64_t now) {
         if (c->serial) {
             fprintf(stderr, "Serial client read error: %s\n", strerror(err));
         }
-        if (Modes.debug_net) {
+        if (c->con) {
+            snprintf(c->con->lastErr, sizeof(c->con->lastErr), "socket error: %s", strerror(err));
+            feedEvent("%s: Socket Error: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)",
+                    c->service->descr, strerror(err), c->host, c->port,
+                    c->fd, c->sendq_len, c->buflen);
+        } else if (Modes.debug_net) {
             fprintf(stderr, "%s: Socket Error: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
                     c->service->descr, strerror(err), c->host, c->port,
                     c->fd, c->sendq_len, c->buflen);
@@ -5096,7 +5796,8 @@ static int readClient(struct client *c, int64_t now) {
             if (Modes.synthetic_now) {
                 Modes.synthetic_now = 0;
             }
-            fprintf(stderr, "%s: Remote server disconnected: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
+            snprintf(c->con->lastErr, sizeof(c->con->lastErr), "remote closed connection");
+            feedEvent("%s: Remote server disconnected: %s port %s (fd %d, SendQ %d, RecvQ %d)",
                     c->service->descr, c->con->address, c->con->port, c->fd, c->sendq_len, c->buflen);
         } else if (Modes.debug_net && !Modes.netIngest) {
             fprintf(stderr, "%s: Listen client disconnected: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
@@ -5206,6 +5907,16 @@ static int readBeastcommand(struct client *c, int64_t now, struct messageBuffer 
         } else if (*p == 'N') { // NIC/NACp clamping command
             // Format: N + nic_min (1 byte) + nacp_min (1 byte)
             eom = p + 3;
+        } else if (*p == 'F') { // feed status record, newline terminated text
+            char *nl = memchr(p, '\n', c->eod - p);
+            if (!nl) {
+                if (c->eod - p > 4096) {
+                    ++c->som;
+                    continue;
+                }
+                break; // wait for the rest
+            }
+            eom = nl + 1;
         } else {
             // Not a valid beast command, skip 0x1a and try again
             ++c->som;
@@ -5691,6 +6402,25 @@ static int readBeast(struct client *c, int64_t now, struct messageBuffer *mb) {
             Modes.received_efb_ownship_rate = ownship_rate / 10.0f;
             Modes.received_efb_traffic_rate = traffic_rate / 10.0f;
             c->som = p;
+            continue;
+        } else if (ch == 'F') {
+            // Feed status record from readsb server
+            // Format: 0x1a + F + text + '\n'  (text never contains 0x1a)
+            p++;
+            char *nl = memchr(p, '\n', c->eod - p);
+            if (!nl) {
+                if (c->eod - p > 4096) {
+                    // no terminator in a long stretch, treat as garbage
+                    c->som = p;
+                    continue;
+                }
+                break;  // incomplete record
+            }
+            *nl = '\0';
+            if (Modes.viewadsb) {
+                feedParseRecord(p);
+            }
+            c->som = nl + 1;
             continue;
         } else if (ch == 'N') {
             // NIC/NACp clamping command from readsb server
@@ -6862,6 +7592,7 @@ struct modesMessage *netGetMM(struct messageBuffer *buf) {
 //
 
 void netUseMessage(struct modesMessage *mm) {
+    Modes.feed.msgsDecoded++;
     struct messageBuffer *buf = mm->messageBuffer;
     if (mm != &buf->msg[buf->len]) {
         fprintf(stderr, "FATAL: fix netUseMessage / get_mm\n");
@@ -6926,7 +7657,7 @@ void efbInit(void) {
     memcpy(&efb_addr.sin_addr, he->h_addr_list[0], he->h_length);
 
     Modes.efb_next_update = mono_milli_seconds();
-    fprintf(stderr, "EFB: XGPS/XTRAFFIC output initialized to %s:%d\n",
+    feedEvent("EFB: XGPS/XTRAFFIC output initialized to %s:%d",
             inet_ntoa(efb_addr.sin_addr), Modes.efb_port);
 }
 
@@ -7948,7 +8679,7 @@ static void gdl90ProcessDiscovery(void) {
         Modes.gdl90_target_addr.sin_port = htons(port);
 
         if (!was_valid) {
-            fprintf(stderr, "GDL90: Discovered EFB at %s:%d\n",
+            feedEvent("GDL90: Discovered EFB at %s:%d",
                     inet_ntoa(sender_addr.sin_addr), port);
             gdl90Log("DISCOVERY", "EFB discovered at %s:%d",
                      inet_ntoa(sender_addr.sin_addr), port);
@@ -7991,7 +8722,7 @@ void gdl90Init(void) {
             return;
         }
         Modes.gdl90_target_valid = 1;
-        fprintf(stderr, "GDL90: Sending to %s:%d\n", Modes.gdl90_ip, Modes.gdl90_port);
+        feedEvent("GDL90: Sending to %s:%d", Modes.gdl90_ip, Modes.gdl90_port);
         gdl90Log("STATIC_IP", "Configured to send to %s:%d", Modes.gdl90_ip, Modes.gdl90_port);
     } else {
         // No static IP - set up discovery listener
@@ -8029,7 +8760,7 @@ void gdl90Init(void) {
             return;
         }
 
-        fprintf(stderr, "GDL90: Listening for EFB announcements on port %d\n", GDL90_LISTEN_PORT);
+        feedEvent("GDL90: Listening for EFB announcements on port %d", GDL90_LISTEN_PORT);
     }
 
     Modes.gdl90_next_update = mono_milli_seconds();
@@ -8064,7 +8795,7 @@ void gdl90PeriodicWork(void) {
 
         // Check if target has timed out (use monotonic time)
         if (Modes.gdl90_target_valid && mono > Modes.gdl90_target_timeout) {
-            fprintf(stderr, "GDL90: EFB connection timed out\n");
+            feedEvent("GDL90: EFB connection timed out");
             gdl90Log("TIMEOUT", "EFB connection timed out");
             Modes.gdl90_target_valid = 0;
         }

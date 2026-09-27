@@ -540,6 +540,68 @@ struct messageBuffer {
     struct client *activeClient;
 };
 
+// Feed status: per-connector link health, decoder rates and a scrolling event log.
+// Populated locally by readsb (feedStatusUpdate) and broadcast to viewadsb over the
+// beast side channel ('F' command), where the same struct is filled from the received records.
+#define FEED_CONN_MAX 16
+#define FEED_EVENTS_MAX 256
+#define FEED_EVENT_LEN 160
+#define FEED_NAME_LEN 64
+
+struct feedEvent {
+    int64_t time;                   // wall clock ms
+    char msg[FEED_EVENT_LEN];
+};
+
+struct feedConnStatus {
+    char name[FEED_NAME_LEN];       // hostname as configured
+    char port[8];
+    char protocol[24];
+    int state;                      // 0 disconnected, 1 connecting, 2 connected
+    int dropActive;                 // currently dropping data (link congested)
+    int64_t sinceSec;               // seconds in current state
+    double msgRate;                 // messages/s queued to this connection (last second)
+    double byteRate;                // wire bytes/s (last second)
+    uint64_t msgsSent;              // total messages queued since program start
+    double loss1m;                  // % of offered bytes dropped, last 60 s
+    double lossTotal;               // % of offered bytes dropped, since program start
+    int ping;                       // ICMP echo round trip to the host, smoothed ms (-1 none)
+    int pingLoss;                   // % of ICMP echoes unanswered, last minute (-1 none sent)
+    int rtt;                        // smoothed RTT ms from kernel TCP stats (-1 unknown)
+    int rttVar;                     // RTT variance ms
+    int64_t retrans;                // total retransmitted packets this connection (-1 unknown)
+    int unacked;                    // bytes in the kernel send buffer (in flight + unsent), -1 unknown
+    int sendqPct;                   // send queue fill %
+    int reconnects;                 // number of (re)connects since start
+    int64_t outageSec;              // accumulated seconds not connected since start
+    char lastErr[FEED_NAME_LEN];    // last disconnect / failure reason
+};
+
+struct feedStatus {
+    int64_t updated;                // ms of last update (local or received)
+    double msgRate;                 // decoded messages/s
+    double posRate;                 // decoded positions/s
+    int aircraft;                   // aircraft seen in the last minute
+    int gain;                       // tenths of dB, or MODES_AUTO_GAIN / MODES_MAX_GAIN sentinel
+    double samplesLostRate;         // SDR samples lost or dropped per second
+    int64_t uptimeSec;
+    int gdl90Connected;
+    int connCount;
+    struct feedConnStatus conn[FEED_CONN_MAX];
+    struct feedEvent events[FEED_EVENTS_MAX];
+    int eventHead;                  // next write index
+    int eventCount;                 // number of valid events (<= FEED_EVENTS_MAX)
+    uint64_t eventSeq;              // total events ever added
+    // decoder counters, incremented from the decode path
+    uint64_t msgsDecoded;
+    uint64_t posDecoded;
+    uint64_t prevMsgsDecoded;
+    uint64_t prevPosDecoded;
+    uint64_t prevSamplesLost;
+    int64_t prevUpdate;
+    FILE *logFile;                  // --feed-log CSV file, NULL if disabled
+};
+
 struct _Modes
 { // Internal state
     pthread_mutex_t traceDebugMutex;
@@ -1007,6 +1069,10 @@ struct _Modes
     int64_t efb_rate_period_start;  // Start of current rate tracking period
     float efb_ownship_rate;         // Ownship update rate in Hz
     float efb_traffic_rate;         // Traffic update rate in Hz
+
+    // Feed status (link health display, see feedStatusUpdate in net_io.c)
+    struct feedStatus feed;
+    int8_t feed_page;               // interactive: 1 = show feed status page instead of aircraft list
 };
 
 extern struct _Modes Modes;
@@ -1422,6 +1488,8 @@ enum {
     OptGdl90Log,
     OptGdl90NicMin,
     OptGdl90NacpMin,
+    OptFeedLog,
+    OptFeedStatus,
 };
 
 

@@ -1392,6 +1392,13 @@ static void backgroundTasks(int64_t now) {
         broadcastEfbRates();
     }
 
+    // Feed status: per-connector link health, decoder rates, broadcast to viewadsb
+    static int64_t next_feed_update;
+    if (now >= next_feed_update) {
+        next_feed_update = now + 1 * SECONDS;
+        feedStatusUpdate(now);
+    }
+
     // Refresh screen when in interactive mode
     static int64_t next_interactive;
     if (Modes.interactive && now > next_interactive) {
@@ -1438,6 +1445,10 @@ static void cleanup_and_exit(int code) {
     // Free any used memory
     geomag_destroy();
     interactiveCleanup();
+    if (Modes.feed.logFile) {
+        fclose(Modes.feed.logFile);
+        Modes.feed.logFile = NULL;
+    }
     cleanup_globe_index();
     sfree(Modes.dev_name);
     sfree(Modes.filename);
@@ -1784,6 +1795,18 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 fprintf(stderr, "GDL90 output enabled, sending to %s:%d\n", Modes.gdl90_ip, Modes.gdl90_port);
             }
             break;
+        case OptFeedLog:
+            Modes.feed.logFile = fopen(arg, "a");
+            if (!Modes.feed.logFile) {
+                fprintf(stderr, "Error: Cannot open feed log file '%s': %s\n", arg, strerror(errno));
+                return 1;
+            }
+            setvbuf(Modes.feed.logFile, NULL, _IOLBF, 0);
+            fprintf(Modes.feed.logFile, "# D,time_ms,msg_rate,pos_rate,aircraft,gain_tenths_db,samples_lost_rate,gdl90_connected\n"
+                    "# S,time_ms,host,port,state(0=down,1=connecting,2=up),dropping,since_s,msg_rate,wire_bytes_rate,msgs_sent,loss_1m_pct,loss_total_pct,ping_ms,ping_loss_pct,tcp_rtt_ms,tcp_rttvar_ms,retrans,kernel_queue_bytes,sendq_pct,reconnects,outage_s\n"
+                    "# E,time_ms,\"message\"\n");
+            fprintf(stderr, "Feed logging enabled to %s\n", arg);
+            break;
         case OptGdl90Log:
             Modes.gdl90_log_file = fopen(arg, "a");
             if (!Modes.gdl90_log_file) {
@@ -1910,6 +1933,11 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptInteractive:
             Modes.interactive = 1;
             Modes.quiet = 1;
+            break;
+        case OptFeedStatus:
+            Modes.interactive = 1;
+            Modes.quiet = 1;
+            Modes.feed_page = 1;
             break;
         case OptInteractiveTTL:
             Modes.interactive_display_ttl = (int64_t) (1000 * atof(arg));

@@ -146,6 +146,7 @@ int64_t lapWatch(struct timespec *start_time);
 // get nanoseconds and some other stuff for use with srand
 unsigned int get_seed();
 
+void printTimestamp(FILE *stream, int64_t time_ms);
 void log_with_timestamp(const char *format, ...) __attribute__ ((format(printf, 1, 2)));
 
 // based on a give epoch time in ms, calculate the nearest offset interval step

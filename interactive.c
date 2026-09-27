@@ -376,9 +376,82 @@ void interactiveSendNicNacp(void) {
     }
 }
 
+// While ncurses owns the screen, anything written to stderr (SDR messages, gain
+// changes, warnings) would scribble over the display. Redirect stderr into a pipe
+// and turn each line into an event on the feed status page instead.
+static int stderrPipe = -1;   // read end
+static int stderrSaved = -1;  // original stderr, restored on cleanup
+
+static void interactiveCaptureStderr(void) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return;
+    }
+    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK); // never block a writer, drop instead
+    fflush(stderr);
+    stderrSaved = dup(STDERR_FILENO);
+    if (dup2(fds[1], STDERR_FILENO) < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        stderrSaved = -1;
+        return;
+    }
+    close(fds[1]);
+    stderrPipe = fds[0];
+}
+
+static void interactiveDrainStderr(void) {
+    static char acc[FEED_EVENT_LEN];
+    static int accLen;
+    if (stderrPipe < 0) {
+        return;
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(stderrPipe, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char ch = buf[i];
+            if (ch == '\n' || ch == '\r') {
+                if (accLen > 0) {
+                    acc[accLen] = '\0';
+                    // strip the "[timestamp] " prefix of log_with_timestamp lines, events carry their own time
+                    char *msg = acc;
+                    if (msg[0] == '[') {
+                        char *close = strstr(msg, "] ");
+                        if (close) {
+                            msg = close + 2;
+                        }
+                    }
+                    feedEvent("%s", msg);
+                }
+                accLen = 0;
+            } else if (accLen < (int) sizeof(acc) - 1) {
+                acc[accLen++] = ch;
+            }
+        }
+    }
+}
+
+static void interactiveRestoreStderr(void) {
+    if (stderrSaved >= 0) {
+        interactiveDrainStderr();
+        fflush(stderr);
+        dup2(stderrSaved, STDERR_FILENO);
+        close(stderrSaved);
+        stderrSaved = -1;
+    }
+    if (stderrPipe >= 0) {
+        close(stderrPipe);
+        stderrPipe = -1;
+    }
+}
+
 void interactiveInit() {
     if (!Modes.interactive)
         return;
+
+    interactiveCaptureStderr();
 
     initscr();
     // Initialize color support
@@ -389,6 +462,8 @@ void interactiveInit() {
         init_pair(1, COLOR_MAGENTA, -1);  // Magenta on default background
         init_pair(2, COLOR_GREEN, -1);    // Green on default background
         init_pair(3, COLOR_CYAN, -1);     // Cyan on default background (ownship)
+        init_pair(4, COLOR_YELLOW, -1);   // Yellow: degraded link
+        init_pair(5, COLOR_RED, -1);      // Red: link down / stale
     }
 
     // Enable non-blocking keyboard input
@@ -654,6 +729,7 @@ static int printAircraftRow(struct aircraft *a, int row, int64_t now, int is_own
 void interactiveCleanup(void) {
     if (Modes.interactive) {
         endwin();
+        interactiveRestoreStderr();
     }
 }
 
@@ -823,9 +899,377 @@ static int (*getCompareFunction(void))(const void *, const void *) {
     }
 }
 
+static int64_t next_clear;
+
+// Keyboard handling for the interactive display
+static void interactiveHandleKeys(void) {
+    int ch;
+    while ((ch = getch()) != ERR) {
+        if (ch == 'f' || ch == 'F') {
+            // toggle feed status page (readsb and viewadsb)
+            Modes.feed_page = !Modes.feed_page;
+            next_clear = 0;
+            continue;
+        }
+        if (!Modes.viewadsb) {
+            continue;
+        }
+        {
+            if (sort_input_active) {
+                // Sort selection mode
+                if (ch == 27 || ch == 's' || ch == 'S') {  // ESC or 's' to exit sort mode
+                    sort_input_active = 0;
+                } else if (ch >= '1' && ch <= '6') {
+                    sort_mode_t new_mode = (sort_mode_t)(ch - '1');
+                    if (new_mode == current_sort_mode) {
+                        // Same mode - toggle direction
+                        sort_ascending = !sort_ascending;
+                    } else {
+                        // New mode - reset to ascending
+                        current_sort_mode = new_mode;
+                        sort_ascending = 1;
+                    }
+                    sort_input_active = 0;
+                } else if (ch == 'd' || ch == 'D') {
+                    current_sort_mode = SORT_DISTANCE;
+                    sort_input_active = 0;
+                } else if (ch == 'a' || ch == 'A') {
+                    current_sort_mode = SORT_ALTITUDE;
+                    sort_input_active = 0;
+                } else if (ch == 'c' || ch == 'C') {
+                    current_sort_mode = SORT_CALLSIGN;
+                    sort_input_active = 0;
+                } else if (ch == 't' || ch == 'T') {  // 't' for type/category
+                    current_sort_mode = SORT_CATEGORY;
+                    sort_input_active = 0;
+                } else if (ch == 'g' || ch == 'G') {  // 'g' for ground speed
+                    current_sort_mode = SORT_SPEED;
+                    sort_input_active = 0;
+                } else if (ch == 'r' || ch == 'R') {
+                    current_sort_mode = SORT_RSSI;
+                    sort_input_active = 0;
+                }
+            } else if (nicnacp_input_active) {
+                // NIC/NACp input mode
+                if (ch == 27) {  // ESC key - cancel input
+                    nicnacp_input_len = 0;
+                    nicnacp_input[0] = '\0';
+                    nicnacp_input_active = 0;
+                } else if (ch == '\n' || ch == '\r') {  // Enter - submit
+                    if (nicnacp_input_len > 0) {
+                        nicnacp_input[nicnacp_input_len] = '\0';
+                        setNicNacpFromInput(nicnacp_input);
+                    } else {
+                        setNicNacpFromInput(NULL);
+                    }
+                    nicnacp_input_len = 0;
+                    nicnacp_input[0] = '\0';
+                    nicnacp_input_active = 0;
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
+                    if (nicnacp_input_len > 0) {
+                        nicnacp_input_len--;
+                        nicnacp_input[nicnacp_input_len] = '\0';
+                    }
+                    if (nicnacp_input_len == 0) {
+                        nicnacp_input_active = 0;
+                    }
+                } else if (((ch >= '0' && ch <= '9') || ch == ',') && nicnacp_input_len < 15) {
+                    nicnacp_input[nicnacp_input_len++] = (char)ch;
+                    nicnacp_input[nicnacp_input_len] = '\0';
+                }
+            } else if (ownship_input_active) {
+                // Ownship input mode
+                if (ch == 27) {  // ESC key - cancel input
+                    ownship_input_len = 0;
+                    ownship_input[0] = '\0';
+                    ownship_input_active = 0;
+                } else if (ch == '\n' || ch == '\r') {  // Enter - submit
+                    if (ownship_input_len > 0) {
+                        ownship_input[ownship_input_len] = '\0';
+                        setOwnshipFromInput(ownship_input);
+                    } else {
+                        // Empty input clears ownship
+                        setOwnshipFromInput(NULL);
+                    }
+                    ownship_input_len = 0;
+                    ownship_input[0] = '\0';
+                    ownship_input_active = 0;
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
+                    if (ownship_input_len > 0) {
+                        ownship_input_len--;
+                        ownship_input[ownship_input_len] = '\0';
+                    }
+                    if (ownship_input_len == 0) {
+                        ownship_input_active = 0;
+                    }
+                } else if (ch >= 32 && ch < 127 && ownship_input_len < 15) {  // Printable char
+                    ownship_input[ownship_input_len++] = (char)ch;
+                    ownship_input[ownship_input_len] = '\0';
+                }
+            } else {
+                // Normal mode - check for command keys
+                if (ch == 'o' || ch == 'O') {
+                    ownship_input_active = 1;
+                    ownship_input_len = 0;
+                    ownship_input[0] = '\0';
+                } else if (ch == 'n' || ch == 'N') {
+                    nicnacp_input_active = 1;
+                    nicnacp_input_len = 0;
+                    nicnacp_input[0] = '\0';
+                } else if (ch == 's' || ch == 'S') {
+                    sort_input_active = 1;
+                } else if (ch == 'q' || ch == 'Q') {
+                    // Quick toggle sort direction
+                    sort_ascending = !sort_ascending;
+                }
+            }
+        }
+    }
+
+}
+
+
+static void feedFmtDuration(char *buf, int len, int64_t sec) {
+    if (sec < 0) {
+        sec = 0;
+    }
+    if (sec >= 86400) {
+        snprintf(buf, len, "%lldd%02lld:%02lld", (long long) (sec / 86400), (long long) ((sec / 3600) % 24), (long long) ((sec / 60) % 60));
+    } else {
+        snprintf(buf, len, "%02lld:%02lld:%02lld", (long long) (sec / 3600), (long long) ((sec / 60) % 60), (long long) (sec % 60));
+    }
+}
+
+static void feedFmtCount(char *buf, int len, uint64_t n) {
+    if (n >= 10000000ULL) {
+        snprintf(buf, len, "%.1fM", n / 1e6);
+    } else if (n >= 10000ULL) {
+        snprintf(buf, len, "%.1fk", n / 1e3);
+    } else {
+        snprintf(buf, len, "%llu", (unsigned long long) n);
+    }
+}
+
+static int feedEventCompare(const void *a, const void *b) {
+    const struct feedEvent *ea = a;
+    const struct feedEvent *eb = b;
+    if (ea->time < eb->time) return -1;
+    if (ea->time > eb->time) return 1;
+    return 0;
+}
+
+// Feed status page: decoder summary and per-connector link health stay at the
+// top, the event log scrolls underneath.
+static void feedPageDraw(int64_t now) {
+    struct feedStatus *fs = &Modes.feed;
+    int rows = getmaxy(stdscr);
+    int cols = getmaxx(stdscr);
+    char buf[64];
+
+    erase();
+
+    // --- decoder line ---
+    move(0, 0);
+    if (has_colors()) attron(A_BOLD);
+    printw("Decoder ");
+    if (has_colors()) attroff(A_BOLD);
+    int stale = fs->updated == 0 || now - fs->updated > 5 * SECONDS;
+    if (stale) {
+        if (has_colors()) attron(COLOR_PAIR(5) | A_BOLD);
+        if (fs->updated == 0) {
+            printw("no status received from readsb yet");
+        } else {
+            printw("STALE: no status from readsb for %lld s", (long long) ((now - fs->updated) / 1000));
+        }
+        if (has_colors()) attroff(COLOR_PAIR(5) | A_BOLD);
+    } else {
+        printw("%6.0f msg/s %5.0f pos/s %4d acft  ", fs->msgRate, fs->posRate, fs->aircraft);
+        if (fs->gain == MODES_AUTO_GAIN || fs->gain == MODES_MAX_GAIN || fs->gain == 0) {
+            printw("gain auto  ");
+        } else {
+            printw("gain %.1f dB  ", fs->gain / 10.0);
+        }
+        if (fs->samplesLostRate > 0) {
+            if (has_colors()) attron(COLOR_PAIR(4));
+            printw("lost samples %.0f/s  ", fs->samplesLostRate);
+            if (has_colors()) attroff(COLOR_PAIR(4));
+        }
+        feedFmtDuration(buf, sizeof(buf), fs->uptimeSec);
+        printw("up %s  ", buf);
+        if (fs->gdl90Connected) {
+            if (has_colors()) attron(COLOR_PAIR(2));
+            printw("GDL90: EFB connected");
+            if (has_colors()) attroff(COLOR_PAIR(2));
+        } else {
+            printw("GDL90: no EFB");
+        }
+        if (Modes.viewadsb && (Modes.received_efb_ownship_rate > 0 || Modes.received_efb_traffic_rate > 0)) {
+            printw(" (own %.1fHz tfc %.1fHz)", Modes.received_efb_ownship_rate, Modes.received_efb_traffic_rate);
+        }
+    }
+
+    // --- connector table ---
+    move(1, 0);
+    if (has_colors()) attron(A_BOLD);
+    printw("%-30s %-18s %-5s %-9s %6s %6s %7s %6s %6s %7s %5s %7s %5s %4s %5s %3s %-9s %s",
+            "Feed", "Protocol", "State", "Since", "msg/s", "kB/s", "Sent", "Loss1m", "LossT", "Ping", "PLoss", "TcpRTT", "Rtx", "KrnQ", "SendQ", "Rc", "Outage", "Last error");
+    if (has_colors()) attroff(A_BOLD);
+    mvhline(2, 0, ACS_HLINE, cols);
+
+    int row = 3;
+    if (fs->connCount == 0) {
+        mvprintw(row++, 0, "(no net-connectors configured)");
+    }
+    for (int i = 0; i < fs->connCount && row < rows - 3; i++) {
+        struct feedConnStatus *st = &fs->conn[i];
+        char name[48];
+        snprintf(name, sizeof(name), "%s:%s", st->name, st->port);
+        char since[32], outage[32], sent[16], rtt[16], rtx[16], infl[16], l1[16], lt[16], ping[16], ploss[16];
+        feedFmtDuration(since, sizeof(since), st->sinceSec);
+        feedFmtDuration(outage, sizeof(outage), st->outageSec);
+        feedFmtCount(sent, sizeof(sent), st->msgsSent);
+        if (st->rtt >= 0) {
+            snprintf(rtt, sizeof(rtt), "%dms", st->rtt);
+        } else {
+            snprintf(rtt, sizeof(rtt), "-");
+        }
+        if (st->ping >= 0) {
+            snprintf(ping, sizeof(ping), "%dms", st->ping);
+        } else {
+            snprintf(ping, sizeof(ping), "-");
+        }
+        if (st->pingLoss >= 0) {
+            snprintf(ploss, sizeof(ploss), "%d%%", st->pingLoss);
+        } else {
+            snprintf(ploss, sizeof(ploss), "-");
+        }
+        if (st->retrans >= 0) {
+            feedFmtCount(rtx, sizeof(rtx), (uint64_t) st->retrans);
+        } else {
+            snprintf(rtx, sizeof(rtx), "-");
+        }
+        if (st->unacked >= 0) {
+            snprintf(infl, sizeof(infl), "%dk", (st->unacked + 512) / 1024);
+        } else {
+            snprintf(infl, sizeof(infl), "-");
+        }
+        if (st->loss1m >= 0) {
+            snprintf(l1, sizeof(l1), "%.1f%%", st->loss1m);
+            snprintf(lt, sizeof(lt), "%.1f%%", st->lossTotal);
+        } else {
+            snprintf(l1, sizeof(l1), "-");
+            snprintf(lt, sizeof(lt), "-");
+        }
+
+        const char *stateStr;
+        int pair;
+        if (stale) {
+            stateStr = "?";
+            pair = 5;
+        } else if (st->state == 2 && st->dropActive) {
+            stateStr = "DROP";
+            pair = 4;
+        } else if (st->state == 2) {
+            stateStr = "UP";
+            pair = 2;
+        } else if (st->state == 1) {
+            stateStr = "CONN";
+            pair = 4;
+        } else {
+            stateStr = "DOWN";
+            pair = 5;
+        }
+
+        mvprintw(row, 0, "%-30.30s %-18.18s ", name, st->protocol);
+        if (has_colors()) attron(COLOR_PAIR(pair) | A_BOLD);
+        printw("%-5s", stateStr);
+        if (has_colors()) attroff(COLOR_PAIR(pair) | A_BOLD);
+        printw(" %-9s %6.0f %6.1f %7s ", since, st->msgRate, st->byteRate / 1000.0, sent);
+
+        int lossPair = (st->loss1m > 10) ? 5 : (st->loss1m > 0.5 ? 4 : 0);
+        if (lossPair && has_colors()) attron(COLOR_PAIR(lossPair));
+        printw("%6s %6s", l1, lt);
+        if (lossPair && has_colors()) attroff(COLOR_PAIR(lossPair));
+
+        int pingPair = (st->ping > 5000 || (st->ping < 0 && st->pingLoss > 0)) ? 5 : (st->ping > 2500 ? 4 : 0);
+        if (pingPair && has_colors()) attron(COLOR_PAIR(pingPair));
+        printw(" %7s", ping);
+        if (pingPair && has_colors()) attroff(COLOR_PAIR(pingPair));
+
+        int plossPair = (st->pingLoss > 25) ? 5 : (st->pingLoss > 5 ? 4 : 0);
+        if (plossPair && has_colors()) attron(COLOR_PAIR(plossPair));
+        printw(" %5s", ploss);
+        if (plossPair && has_colors()) attroff(COLOR_PAIR(plossPair));
+
+        int rttPair = (st->rtt > 2000) ? 5 : (st->rtt > 800 ? 4 : 0);
+        if (rttPair && has_colors()) attron(COLOR_PAIR(rttPair));
+        printw(" %7s", rtt);
+        if (rttPair && has_colors()) attroff(COLOR_PAIR(rttPair));
+
+        printw(" %5s %4s %4d%% %3d %-9s ", rtx, infl, st->sendqPct, st->reconnects, outage);
+        if (st->state != 2 && st->lastErr[0]) {
+            if (has_colors()) attron(COLOR_PAIR(5));
+            printw("%.40s", st->lastErr);
+            if (has_colors()) attroff(COLOR_PAIR(5));
+        } else if (st->lastErr[0]) {
+            printw("(last: %.32s)", st->lastErr);
+        }
+        row++;
+    }
+
+    // --- events ---
+    mvhline(row, 0, ACS_HLINE, cols);
+    mvprintw(row, 2, " Events ");
+    row++;
+
+    int avail = rows - 1 - row;
+    if (avail < 0) {
+        avail = 0;
+    }
+    // events arrive out of order in viewadsb (replayed history after local ones),
+    // so show them sorted by time
+    static struct feedEvent sorted[FEED_EVENTS_MAX];
+    int first = (fs->eventHead - fs->eventCount + FEED_EVENTS_MAX) % FEED_EVENTS_MAX;
+    for (int i = 0; i < fs->eventCount; i++) {
+        sorted[i] = fs->events[(first + i) % FEED_EVENTS_MAX];
+    }
+    qsort(sorted, fs->eventCount, sizeof(struct feedEvent), feedEventCompare);
+    int show = fs->eventCount < avail ? fs->eventCount : avail;
+    int skip = fs->eventCount - show;
+    for (int i = 0; i < show; i++) {
+        struct feedEvent *e = &sorted[skip + i];
+        time_t t = e->time / 1000;
+        struct tm tm;
+        localtime_r(&t, &tm);
+        int pair = 0;
+        if (strstr(e->msg, "established") || strstr(e->msg, "recovered") || strstr(e->msg, "Discovered")) {
+            pair = 2;
+        } else if (strstr(e->msg, "congested") || strstr(e->msg, "suppressing")) {
+            pair = 4;
+        } else if (strstr(e->msg, "timed out") || strstr(e->msg, "failed") || strstr(e->msg, "disconnected")
+                || strstr(e->msg, "Error") || strstr(e->msg, "reconnecting") || strstr(e->msg, "Couldn't")) {
+            pair = 5;
+        }
+        mvprintw(row + i, 0, "%02d:%02d:%02d ", tm.tm_hour, tm.tm_min, tm.tm_sec);
+        if (pair && has_colors()) attron(COLOR_PAIR(pair));
+        printw("%.*s", cols - 10, e->msg);
+        if (pair && has_colors()) attroff(COLOR_PAIR(pair));
+    }
+
+    // --- bottom line ---
+    move(rows - 1, 0);
+    clrtoeol();
+    printw("Feed status  [f]=aircraft list");
+    if (Modes.viewadsb) {
+        printw("  [o]=ownship [n]=NIC/NACp");
+    }
+    if (fs->eventCount) {
+        printw("   %d events", fs->eventCount);
+    }
+}
+
 void interactiveShowData(void) {
     static int64_t next_update;
-    static int64_t next_clear;
     int64_t now = mstime();
     char progress;
     char spinner[4] = "|/-\\";
@@ -836,10 +1280,20 @@ void interactiveShowData(void) {
 
     next_update = now + MODES_INTERACTIVE_REFRESH_TIME;
 
+    interactiveDrainStderr();
+
     // Periodically send ownship and NIC/NACp clamping to server (viewadsb only)
     if (Modes.viewadsb) {
         interactiveSendOwnship();
         interactiveSendNicNacp();
+    }
+
+    interactiveHandleKeys();
+
+    if (Modes.feed_page) {
+        feedPageDraw(now);
+        refresh();
+        return;
     }
 
     // clear potential errors every 2 seconds
@@ -989,120 +1443,6 @@ void interactiveShowData(void) {
         }
     }
 
-    // Handle keyboard input (viewadsb only)
-    if (Modes.viewadsb) {
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (sort_input_active) {
-                // Sort selection mode
-                if (ch == 27 || ch == 's' || ch == 'S') {  // ESC or 's' to exit sort mode
-                    sort_input_active = 0;
-                } else if (ch >= '1' && ch <= '6') {
-                    sort_mode_t new_mode = (sort_mode_t)(ch - '1');
-                    if (new_mode == current_sort_mode) {
-                        // Same mode - toggle direction
-                        sort_ascending = !sort_ascending;
-                    } else {
-                        // New mode - reset to ascending
-                        current_sort_mode = new_mode;
-                        sort_ascending = 1;
-                    }
-                    sort_input_active = 0;
-                } else if (ch == 'd' || ch == 'D') {
-                    current_sort_mode = SORT_DISTANCE;
-                    sort_input_active = 0;
-                } else if (ch == 'a' || ch == 'A') {
-                    current_sort_mode = SORT_ALTITUDE;
-                    sort_input_active = 0;
-                } else if (ch == 'c' || ch == 'C') {
-                    current_sort_mode = SORT_CALLSIGN;
-                    sort_input_active = 0;
-                } else if (ch == 't' || ch == 'T') {  // 't' for type/category
-                    current_sort_mode = SORT_CATEGORY;
-                    sort_input_active = 0;
-                } else if (ch == 'g' || ch == 'G') {  // 'g' for ground speed
-                    current_sort_mode = SORT_SPEED;
-                    sort_input_active = 0;
-                } else if (ch == 'r' || ch == 'R') {
-                    current_sort_mode = SORT_RSSI;
-                    sort_input_active = 0;
-                }
-            } else if (nicnacp_input_active) {
-                // NIC/NACp input mode
-                if (ch == 27) {  // ESC key - cancel input
-                    nicnacp_input_len = 0;
-                    nicnacp_input[0] = '\0';
-                    nicnacp_input_active = 0;
-                } else if (ch == '\n' || ch == '\r') {  // Enter - submit
-                    if (nicnacp_input_len > 0) {
-                        nicnacp_input[nicnacp_input_len] = '\0';
-                        setNicNacpFromInput(nicnacp_input);
-                    } else {
-                        setNicNacpFromInput(NULL);
-                    }
-                    nicnacp_input_len = 0;
-                    nicnacp_input[0] = '\0';
-                    nicnacp_input_active = 0;
-                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
-                    if (nicnacp_input_len > 0) {
-                        nicnacp_input_len--;
-                        nicnacp_input[nicnacp_input_len] = '\0';
-                    }
-                    if (nicnacp_input_len == 0) {
-                        nicnacp_input_active = 0;
-                    }
-                } else if (((ch >= '0' && ch <= '9') || ch == ',') && nicnacp_input_len < 15) {
-                    nicnacp_input[nicnacp_input_len++] = (char)ch;
-                    nicnacp_input[nicnacp_input_len] = '\0';
-                }
-            } else if (ownship_input_active) {
-                // Ownship input mode
-                if (ch == 27) {  // ESC key - cancel input
-                    ownship_input_len = 0;
-                    ownship_input[0] = '\0';
-                    ownship_input_active = 0;
-                } else if (ch == '\n' || ch == '\r') {  // Enter - submit
-                    if (ownship_input_len > 0) {
-                        ownship_input[ownship_input_len] = '\0';
-                        setOwnshipFromInput(ownship_input);
-                    } else {
-                        // Empty input clears ownship
-                        setOwnshipFromInput(NULL);
-                    }
-                    ownship_input_len = 0;
-                    ownship_input[0] = '\0';
-                    ownship_input_active = 0;
-                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {  // Backspace
-                    if (ownship_input_len > 0) {
-                        ownship_input_len--;
-                        ownship_input[ownship_input_len] = '\0';
-                    }
-                    if (ownship_input_len == 0) {
-                        ownship_input_active = 0;
-                    }
-                } else if (ch >= 32 && ch < 127 && ownship_input_len < 15) {  // Printable char
-                    ownship_input[ownship_input_len++] = (char)ch;
-                    ownship_input[ownship_input_len] = '\0';
-                }
-            } else {
-                // Normal mode - check for command keys
-                if (ch == 'o' || ch == 'O') {
-                    ownship_input_active = 1;
-                    ownship_input_len = 0;
-                    ownship_input[0] = '\0';
-                } else if (ch == 'n' || ch == 'N') {
-                    nicnacp_input_active = 1;
-                    nicnacp_input_len = 0;
-                    nicnacp_input[0] = '\0';
-                } else if (ch == 's' || ch == 'S') {
-                    sort_input_active = 1;
-                } else if (ch == 'q' || ch == 'Q') {
-                    // Quick toggle sort direction
-                    sort_ascending = !sort_ascending;
-                }
-            }
-        }
-    }
 
     move(row, 0);
     clrtobot();
@@ -1149,7 +1489,7 @@ void interactiveShowData(void) {
             if (viewadsb_nic_min > 0 || viewadsb_nacp_min > 0) {
                 printw(" NIC/NACp min:%d/%d", viewadsb_nic_min, viewadsb_nacp_min);
             }
-            printw("  [o]=ownship [n]=NIC/NACp [s]=sort [q]=reverse");
+            printw("  [o]=ownship [n]=NIC/NACp [s]=sort [q]=reverse [f]=feed status");
         }
     }
 

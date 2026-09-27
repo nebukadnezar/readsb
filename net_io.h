@@ -148,6 +148,14 @@ struct client
     char host[NI_MAXHOST]; // For logging
     char port[NI_MAXSERV];
     int64_t dropHalfAntiSpam;
+    // feed status accounting (see feedStatusUpdate)
+    int8_t dropActive;          // currently in a dropping episode
+    int64_t dropStart;          // when the episode began
+    uint64_t dropStartOffered;  // bytesFromWriter at episode start
+    uint64_t dropStartQueued;   // bytesSent at episode start
+    uint64_t msgsOffered;       // messages the writer offered to this client
+    uint64_t msgsQueued;        // messages actually queued (not dropped)
+    uint64_t bytesWire;         // bytes accepted by send()
 };
 
 // Client connection
@@ -185,6 +193,31 @@ struct net_connector
     struct client dummyClient; // client struct for epoll connection handling before we have a fully established connection
     int enable_uuid_ping;
     char *uuid;
+    // feed status accounting (persists across reconnects)
+    int reconnects;
+    int64_t stateSince;         // when the current connected/disconnected state began
+    int64_t outageMs;           // accumulated time not connected
+    int64_t lastOutageCheck;
+    uint64_t totalOffered;      // bytes offered over all connections
+    uint64_t totalQueued;       // bytes queued over all connections
+    uint64_t totalMsgsQueued;
+    uint64_t prevOffered;       // client counters at last update (reset on reconnect)
+    uint64_t prevQueued;
+    uint64_t prevMsgsQueued;
+    uint64_t prevWire;
+    uint32_t ringOffered[60];   // per-second offered bytes, last 60 s
+    uint32_t ringQueued[60];
+    int ringIdx;
+    char lastErr[64];
+    // ICMP echo to the feed host (end to end, unaffected by TCP proxies on the link)
+    struct sockaddr_in pingAddr;
+    int pingAddrValid;
+    uint16_t pingSeq;
+    int pingRttLast;            // ms, -1 unknown
+    double pingRttAvg;          // smoothed, 0 = none yet
+    int64_t pingLastReply;
+    uint32_t ringPingSent[60];
+    uint32_t ringPingRecv[60];
 };
 
 // Common writer state for all output sockets of one type
@@ -200,6 +233,7 @@ struct net_writer
     int64_t flushInterval;
     uint64_t lastReceiverId;
     int noTimestamps;
+    int msgsPending; // messages in the write buffer not yet flushed to clients
 };
 
 void serviceListen (struct net_service *service, char *bind_addr, char *bind_ports, int epfd);
@@ -212,6 +246,8 @@ void broadcastGain(void);
 void broadcastEfbRates(void);
 void broadcastOwnshipConfig(void);
 void broadcastNicNacpClampConfig(void);
+void feedEvent(const char *format, ...) __attribute__ ((format(printf, 1, 2)));
+void feedStatusUpdate(int64_t now);
 void sendData(struct net_writer *output, char *data, int len);
 
 void modesInitNet (void);

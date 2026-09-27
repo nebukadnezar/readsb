@@ -82,6 +82,7 @@ static struct argp_option optionsReadsb[] = {
     {"gain", OptGain, "<db>", 0, "Set gain (default: auto gain, possible values for rtl-sdr devices: auto auto-verbose 0.0 0.9 1.4 2.7 3.7 7.7 8.7 12.5 14.4 15.7 16.6 19.7 20.7 22.9 25.4 28.0 29.7 32.8 33.8 36.4 37.2 38.6 40.2 42.1 43.4 43.9 44.5 48.0 49.6 58)", 1},
     {"freq", OptFreq, "<hz>", 0, "Set frequency (default: 1090 MHz)", 1},
     {"interactive", OptInteractive, 0, 0, "Interactive mode refreshing data on screen. Implies --throttle", 1},
+    {"feed-status", OptFeedStatus, 0, 0, "Interactive mode starting on the feed status page (decoder rates, feeder connections, event log). Press f to switch to the aircraft list", 1},
     {"raw", OptRaw, 0, 0, "Show only messages hex values", 1},
     {"preamble-threshold", OptPreambleThreshold, "<"stringize(PREAMBLE_THRESHOLD_MIN)"-"stringize(PREAMBLE_THRESHOLD_MAX)">", 0, "lower threshold --> more CPU usage (default: "stringize(PREAMBLE_THRESHOLD_DEFAULT)", pi zero / pi 1: "stringize(PREAMBLE_THRESHOLD_PIZERO)", hot CPU "stringize(PREAMBLE_THRESHOLD_HOT)")", 1},
     {"forward-mlat", OptForwardMlat, 0, 0, "Forward received beast mlat results to beast output ports", 1},
@@ -184,6 +185,7 @@ static struct argp_option optionsReadsb[] = {
     {"gdl90log", OptGdl90Log, "<logfile>", 0, "Log all GDL90 events to file (discovery, disconnect, packets sent)", 2},
     {"gdl90-nic-min", OptGdl90NicMin, "<0-15>", 0, "Minimum NIC value sent in GDL90 messages (default: 0, no clamping)", 2},
     {"gdl90-nacp-min", OptGdl90NacpMin, "<0-15>", 0, "Minimum NACp value sent in GDL90 messages (default: 0, no clamping)", 2},
+    {"feed-log", OptFeedLog, "<logfile>", 0, "Append per-second feed connection status (CSV) and network events to this file", 2},
 #ifdef ENABLE_RTLSDR
     {0,0,0,0, "RTL-SDR options:", 3},
     {0,0,0, OPTION_DOC, "use with --device-type rtlsdr", 3},
