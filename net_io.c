@@ -1732,8 +1732,20 @@ static void feedIcmpInit(void) {
     feedIcmpIdent = (uint16_t) (getpid() & 0xffff);
 #ifdef __linux__
     if (dgram) {
-        // linux rewrites the echo identifier with the socket's local "port"
+        // linux rewrites the echo identifier with the socket's local "port".
+        // The port is only assigned when the socket is bound, which otherwise
+        // happens implicitly on the first sendto: bind it now so the identifier
+        // is known before any request goes out. Ask for the pid based one, fall
+        // back to a kernel chosen one if that is taken.
         struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        sa.sin_port = htons(feedIcmpIdent);
+        if (bind(feedIcmpFd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+            sa.sin_port = 0;
+            bind(feedIcmpFd, (struct sockaddr *) &sa, sizeof(sa));
+        }
         socklen_t len = sizeof(sa);
         if (getsockname(feedIcmpFd, (struct sockaddr *) &sa, &len) == 0) {
             feedIcmpIdent = ntohs(sa.sin_port);
