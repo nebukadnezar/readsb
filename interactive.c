@@ -905,8 +905,10 @@ static int64_t next_clear;
 static void interactiveHandleKeys(void) {
     int ch;
     while ((ch = getch()) != ERR) {
-        if (ch == 'f' || ch == 'F') {
+        int input_active = ownship_input_active || nicnacp_input_active || sort_input_active;
+        if ((ch == 'f' || ch == 'F') && !input_active) {
             // toggle feed status page (readsb and viewadsb)
+            // not while an input prompt is open: 'f' is a valid hex/callsign character
             Modes.feed_page = !Modes.feed_page;
             next_clear = 0;
             continue;
@@ -1272,7 +1274,7 @@ void interactiveShowData(void) {
     static int64_t next_update;
     int64_t now = mstime();
     char progress;
-    char spinner[4] = "|/-\\";
+    const char *spinner = "|/-\\";
 
     // Refresh screen every (MODES_INTERACTIVE_REFRESH_TIME) miliseconde
     if (now < next_update)
